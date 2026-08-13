@@ -1,7 +1,8 @@
 import { Outlet, NavLink, useNavigate } from 'react-router-dom';
 import { useAuth } from '@/context/AuthContext';
 import {
-  LayoutDashboard, FileText, Wallet, Building2, CalendarCheck, LogOut, UserCircle, Calculator,
+  LayoutDashboard, FileText, Wallet, Building2, CalendarCheck, CalendarClock,
+  LogOut, UserCircle, Calculator,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { ROLE_LABELS, SECTION_LABELS, type Role } from '@shared/domain';
@@ -45,6 +46,12 @@ const NAV: NavItem[] = [
     path: '/closing',
     label: 'Закрытие месяца',
     icon: CalendarCheck,
+    roles: ['accountant', 'chief_accountant', 'director'],
+  },
+  {
+    path: '/taxes',
+    label: 'Налоговый календарь',
+    icon: CalendarClock,
     roles: ['accountant', 'chief_accountant', 'director'],
   },
 ];

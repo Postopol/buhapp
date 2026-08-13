@@ -27,7 +27,7 @@ db.pragma('foreign_keys = ON');
  * Версия схемы. При несовпадении база пересоздаётся целиком —
  * прежняя схема госоргана (requests / ifp_data / integrations) несовместима.
  */
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 
 // ── Пароли ──────────────────────────────────────────────────────────────────
 
@@ -301,6 +301,19 @@ function migrate(): boolean {
       done_at TEXT,
       done_by INTEGER REFERENCES users(id),
       note TEXT NOT NULL DEFAULT ''
+    );
+
+    CREATE TABLE tax_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      code TEXT NOT NULL,
+      period TEXT NOT NULL,
+      done INTEGER NOT NULL DEFAULT 0,
+      done_at TEXT,
+      done_by INTEGER REFERENCES users(id),
+      amount_minor INTEGER,
+      note TEXT NOT NULL DEFAULT '',
+      responsible_user_id INTEGER REFERENCES users(id),
+      UNIQUE(code, period)
     );
 
     CREATE TABLE audit_log (

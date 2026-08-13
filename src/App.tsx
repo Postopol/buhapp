@@ -10,6 +10,7 @@ import { Counterparties } from '@/pages/Counterparties';
 import { CounterpartyDetail } from '@/pages/CounterpartyDetail';
 import { Payments } from '@/pages/Payments';
 import { Closing } from '@/pages/Closing';
+import { Taxes } from '@/pages/Taxes';
 
 function ProtectedRoute({ children }: { children: ReactNode }) {
   const { isAuthenticated, loading } = useAuth();
@@ -44,6 +45,7 @@ function AppRoutes() {
         <Route path="counterparties/:id" element={<CounterpartyDetail />} />
         <Route path="payments" element={<Payments />} />
         <Route path="closing" element={<Closing />} />
+        <Route path="taxes" element={<Taxes />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>
     </Routes>

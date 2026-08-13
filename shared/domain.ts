@@ -197,6 +197,116 @@ export const CLOSING_TASK_TEMPLATE: { title: string; hint: string; section: Sect
   },
 ];
 
+// ── Налоговый календарь ─────────────────────────────────────────────────────
+
+export type TaxKind = 'declaration' | 'payment';
+
+export const TAX_KIND_LABELS: Record<TaxKind, string> = {
+  declaration: 'Отчётность',
+  payment: 'Уплата',
+};
+
+export type TaxFrequency = 'monthly' | 'quarterly' | 'yearly';
+
+export const TAX_FREQUENCY_LABELS: Record<TaxFrequency, string> = {
+  monthly: 'Ежемесячно',
+  quarterly: 'Ежеквартально',
+  yearly: 'Раз в год',
+};
+
+export interface TaxRule {
+  code: string;
+  title: string;
+  kind: TaxKind;
+  frequency: TaxFrequency;
+  /**
+   * Срок = `dueDay` числа месяца, отстоящего на `monthOffset` от последнего
+   * месяца отчётного периода. Для года последний месяц — декабрь, поэтому
+   * смещение 3 даёт 31 марта следующего года.
+   */
+  monthOffset: number;
+  dueDay: number;
+  section: Section;
+  hint: string;
+}
+
+/**
+ * Сроки по налоговому кодексу РК. Выпадающие на выходной переносятся
+ * на следующий рабочий день — это делает `server/taxCalendar.ts`.
+ */
+export const TAX_RULES: TaxRule[] = [
+  {
+    code: 'pay-ipn-soc',
+    title: 'Уплата ИПН, ОПВ, СО и ВОСМС',
+    kind: 'payment',
+    frequency: 'monthly',
+    monthOffset: 1,
+    dueDay: 25,
+    section: 'payroll',
+    hint: 'Налоги и социальные платежи с зарплаты за отчётный месяц',
+  },
+  {
+    code: 'fno-200',
+    title: 'ФНО 200.00 — ИПН и социальные платежи',
+    kind: 'declaration',
+    frequency: 'quarterly',
+    monthOffset: 2,
+    dueDay: 15,
+    section: 'payroll',
+    hint: 'Квартальная декларация по доходам работников',
+  },
+  {
+    code: 'fno-300',
+    title: 'ФНО 300.00 — НДС',
+    kind: 'declaration',
+    frequency: 'quarterly',
+    monthOffset: 2,
+    dueDay: 15,
+    section: 'tax',
+    hint: 'Декларация по налогу на добавленную стоимость',
+  },
+  {
+    code: 'pay-nds',
+    title: 'Уплата НДС',
+    kind: 'payment',
+    frequency: 'quarterly',
+    monthOffset: 2,
+    dueDay: 25,
+    section: 'tax',
+    hint: 'НДС за отчётный квартал',
+  },
+  {
+    code: 'fno-870',
+    title: 'ФНО 870.00 — плата за эмиссии в окружающую среду',
+    kind: 'declaration',
+    frequency: 'quarterly',
+    monthOffset: 2,
+    dueDay: 15,
+    section: 'tax',
+    hint: 'Если есть объекты эмиссий',
+  },
+  {
+    code: 'fno-100',
+    title: 'ФНО 100.00 — КПН',
+    kind: 'declaration',
+    frequency: 'yearly',
+    monthOffset: 3,
+    dueDay: 31,
+    section: 'tax',
+    hint: 'Годовая декларация по корпоративному подоходному налогу',
+  },
+  {
+    code: 'pay-kpn',
+    title: 'Уплата КПН по декларации',
+    kind: 'payment',
+    frequency: 'yearly',
+    monthOffset: 4,
+    dueDay: 10,
+    section: 'tax',
+    hint: 'Доплата налога по итогам года',
+  },
+];
+
 // ── Прочее ──────────────────────────────────────────────────────────────────
 
 export const VAT_RATE = 0.12;

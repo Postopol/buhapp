@@ -2,7 +2,8 @@ import { Router } from 'express';
 import { db, today, currentPeriod } from '../db';
 import { requireAuth } from '../auth';
 import type { AuthUser } from '../auth';
-import { CHIEF_APPROVAL_THRESHOLD } from '../../shared/domain';
+import { CHIEF_APPROVAL_THRESHOLD, ACCOUNTING_ROLES } from '../../shared/domain';
+import { upcomingDeadlines } from './taxes';
 
 export const workspaceRouter = Router();
 
@@ -265,8 +266,13 @@ workspaceRouter.get('/', (req, res) => {
     counterparty_name: string | null;
   }[];
 
+  // Налоговые сроки касаются только бухгалтерии и руководителя.
+  const deadlines =
+    ACCOUNTING_ROLES.includes(user.role) || user.role === 'director' ? upcomingDeadlines(5) : [];
+
   res.json({
     queues,
+    deadlines,
     period: {
       period,
       documents: periodStats.documents,

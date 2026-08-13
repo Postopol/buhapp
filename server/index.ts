@@ -7,6 +7,7 @@ import { paymentsRouter } from './routes/payments';
 import { workspaceRouter } from './routes/workspace';
 import { attachmentsRouter } from './routes/attachments';
 import { periodsRouter } from './routes/periods';
+import { taxesRouter } from './routes/taxes';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -26,6 +27,7 @@ app.use('/api/payments', paymentsRouter);
 app.use('/api/workspace', workspaceRouter);
 app.use('/api/attachments', attachmentsRouter);
 app.use('/api/periods', periodsRouter);
+app.use('/api/taxes', taxesRouter);
 
 app.use((_req, res) => {
   res.status(404).json({ error: 'Маршрут не найден' });

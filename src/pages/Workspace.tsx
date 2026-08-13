@@ -1,10 +1,10 @@
 import { useState, useEffect } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
-import { Loader2, ArrowRight, FileText, AlertTriangle, Clock } from 'lucide-react';
+import { Loader2, ArrowRight, FileText, AlertTriangle, Clock, CalendarClock } from 'lucide-react';
 import { useAuth } from '@/context/AuthContext';
 import { getWorkspace } from '@/services/directory';
-import { formatMoneyShort, formatPeriod, formatDateTime, plural } from '@/lib/format';
+import { formatMoneyShort, formatPeriod, formatDate, formatDateTime, plural } from '@/lib/format';
 import { ApprovalChip } from '@/components/StatusChips';
 import { DOC_TYPE_SHORT, SECTION_LABELS } from '@shared/domain';
 import { cn } from '@/lib/utils';
@@ -129,6 +129,54 @@ export function Workspace() {
           );
         })}
       </div>
+
+      {/* Ближайшие сроки — второе измерение работы бухгалтера после документов */}
+      {data.deadlines.length > 0 && (
+        <Card>
+          <CardHeader className="pb-3">
+            <CardTitle className="flex items-center gap-2 text-base">
+              <CalendarClock className="h-4 w-4 text-slate-400" />
+              Ближайшие сроки
+            </CardTitle>
+            <CardDescription>Отчётность и налоги — просрочка и две недели вперёд</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <div className="divide-y divide-slate-100">
+              {data.deadlines.map((deadline) => (
+                <Link
+                  key={`${deadline.code}:${deadline.period}`}
+                  to="/taxes"
+                  className="-mx-2 flex items-center gap-3 rounded px-2 py-2.5 hover:bg-slate-50"
+                >
+                  <span
+                    className={cn(
+                      'h-2 w-2 shrink-0 rounded-full',
+                      deadline.overdue ? 'bg-red-500' : deadline.daysLeft <= 3 ? 'bg-amber-500' : 'bg-slate-300'
+                    )}
+                  />
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate text-sm font-medium text-slate-900">{deadline.title}</div>
+                    <div className="text-xs text-slate-400">
+                      за {deadline.periodLabel}
+                      {deadline.responsibleName && ` · ${deadline.responsibleName}`}
+                    </div>
+                  </div>
+                  <div className="shrink-0 text-right">
+                    <div className="text-sm tabular-nums text-slate-700">{formatDate(deadline.dueDate)}</div>
+                    <div className={cn('text-xs', deadline.overdue ? 'font-medium text-red-600' : 'text-slate-400')}>
+                      {deadline.overdue
+                        ? `просрочен на ${plural(-deadline.daysLeft, 'день', 'дня', 'дней')}`
+                        : deadline.daysLeft === 0
+                          ? 'сегодня'
+                          : `через ${plural(deadline.daysLeft, 'день', 'дня', 'дней')}`}
+                    </div>
+                  </div>
+                </Link>
+              ))}
+            </div>
+          </CardContent>
+        </Card>
+      )}
 
       <div className="grid gap-6 lg:grid-cols-3">
         {/* Сводка по периоду */}

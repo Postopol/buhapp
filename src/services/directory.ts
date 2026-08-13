@@ -7,6 +7,7 @@ import type {
   Payment,
   PeriodDetail,
   PeriodSummaryRow,
+  TaxCalendar,
   Workspace,
 } from '@/types';
 
@@ -40,6 +41,24 @@ export function closePeriod(period: string): Promise<{ period: PeriodDetail }> {
 
 export function reopenPeriod(period: string, reason: string): Promise<{ period: PeriodDetail }> {
   return request(`/periods/${period}/reopen`, { method: 'POST', body: JSON.stringify({ reason }) });
+}
+
+// ── Налоговый календарь ─────────────────────────────────────────────────────
+
+export function getTaxCalendar(from?: string, to?: string): Promise<TaxCalendar> {
+  return request(`/taxes${buildQuery({ from, to })}`);
+}
+
+export function toggleTaxEvent(code: string, period: string): Promise<{ event: { done: boolean } }> {
+  return request(`/taxes/${code}/${period}/toggle`, { method: 'POST' });
+}
+
+export function saveTaxDetails(
+  code: string,
+  period: string,
+  data: { amount?: number | null; note?: string }
+): Promise<{ ok: boolean }> {
+  return request(`/taxes/${code}/${period}/details`, { method: 'POST', body: JSON.stringify(data) });
 }
 
 // ── Контрагенты ─────────────────────────────────────────────────────────────

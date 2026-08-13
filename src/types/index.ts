@@ -226,8 +226,38 @@ export interface RecentDocument {
   counterpartyName: string | null;
 }
 
+export interface TaxEvent {
+  code: string;
+  title: string;
+  kind: 'declaration' | 'payment';
+  frequency: 'monthly' | 'quarterly' | 'yearly';
+  section: Section;
+  hint: string;
+  period: string;
+  periodLabel: string;
+  dueDate: string;
+  shifted: boolean;
+  done: boolean;
+  doneAt: string | null;
+  doneByName: string | null;
+  amount: number | null;
+  note: string;
+  responsibleName: string | null;
+  daysLeft: number;
+  overdue: boolean;
+}
+
+export interface TaxCalendar {
+  events: TaxEvent[];
+  from: string;
+  to: string;
+  today: string;
+  summary: { total: number; done: number; overdue: number; soon: number };
+}
+
 export interface Workspace {
   queues: Queue[];
+  deadlines: TaxEvent[];
   period: PeriodSummary;
   recent: RecentDocument[];
 }

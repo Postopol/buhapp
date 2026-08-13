@@ -14,6 +14,7 @@ import { ApiError } from '@/services/api';
 import { formatAmount, formatMoneyShort, formatDate, dueLabel, formatPeriod, plural } from '@/lib/format';
 import { ApprovalChip, OriginalChip, PaymentChip, PostingChip } from '@/components/StatusChips';
 import { DocumentFormModal } from '@/components/DocumentFormModal';
+import { SavedViews } from '@/components/SavedViews';
 import {
   APPROVAL_LABELS, DOC_TYPE_LABELS, DOC_TYPE_SHORT, DOC_TYPES, ORIGINAL_LABELS,
   ORIGINAL_STATUSES, PAGE_SIZE, SECTIONS, SECTION_LABELS,
@@ -128,6 +129,22 @@ export function Documents() {
     (k) => k !== 'search' && k !== 'sort' && k !== 'dir' && params.get(k)
   ).length;
 
+  /** Текущий фильтр в том же виде, в каком он хранится в пресете. */
+  const currentQuery = useMemo(() => {
+    const out: Record<string, string> = {};
+    for (const key of FILTER_KEYS) {
+      const value = params.get(key);
+      if (value && value !== 'all') out[key] = value;
+    }
+    return out;
+  }, [params]);
+
+  const applyView = (query: Record<string, string>) => {
+    setSearchDraft(query.search ?? '');
+    setParams(new URLSearchParams(query));
+    setSelected(new Set());
+  };
+
   const documents = data?.documents ?? [];
   const allSelected = documents.length > 0 && documents.every((d) => selected.has(d.id));
 
@@ -222,6 +239,9 @@ export function Documents() {
           )}
         </div>
       </div>
+
+      {/* Сохранённые фильтры со счётчиками — личная панель работы */}
+      <SavedViews current={currentQuery} onApply={applyView} />
 
       <Card>
         <CardContent className="space-y-4 p-4">

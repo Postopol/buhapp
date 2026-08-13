@@ -157,7 +157,7 @@ const SORTABLE: Record<string, string> = {
   updatedAt: 'd.updated_at',
 };
 
-interface ListQuery {
+export interface ListQuery {
   search?: string;
   type?: string;
   section?: string;
@@ -837,5 +837,24 @@ documentsRouter.post('/:id(\\d+)/comments', (req, res) => {
     },
   });
 });
+
+/**
+ * Счётчик для сохранённого фильтра. Считает тем же построителем, что и реестр,
+ * иначе цифра на плитке и содержимое списка со временем разойдутся.
+ */
+export function countForFilters(query: ListQuery, user: AuthUser): { count: number; amount: number } {
+  const { where, params } = buildFilters(query, user);
+  return db
+    .prepare(
+      `SELECT COUNT(*) AS count, COALESCE(SUM(d.amount_minor), 0) AS amount
+       FROM documents d
+       LEFT JOIN counterparties cp ON cp.id = d.counterparty_id
+       LEFT JOIN (
+         SELECT document_id, SUM(amount_minor) AS paid FROM document_payments GROUP BY document_id
+       ) pay ON pay.document_id = d.id
+       WHERE ${where}`
+    )
+    .get(...params) as { count: number; amount: number };
+}
 
 export { mapDoc, BASE_SELECT, type DocRow };

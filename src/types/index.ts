@@ -308,6 +308,17 @@ export interface Payment {
   allocations: PaymentAllocation[];
 }
 
+export interface SavedView {
+  id: number;
+  name: string;
+  query: Record<string, string>;
+  shared: boolean;
+  ownerName: string | null;
+  mine: boolean;
+  count: number;
+  amount: number;
+}
+
 export interface BulkResult {
   applied: number[];
   skipped: { id: number; number: string; reason: string }[];

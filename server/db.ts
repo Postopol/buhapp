@@ -27,7 +27,7 @@ db.pragma('foreign_keys = ON');
  * Версия схемы. При несовпадении база пересоздаётся целиком —
  * прежняя схема госоргана (requests / ifp_data / integrations) несовместима.
  */
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 5;
 
 // ── Пароли ──────────────────────────────────────────────────────────────────
 
@@ -316,6 +316,16 @@ function migrate(): boolean {
       UNIQUE(code, period)
     );
 
+    CREATE TABLE saved_views (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      query TEXT NOT NULL,
+      shared INTEGER NOT NULL DEFAULT 0,
+      sort INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL
+    );
+
     CREATE TABLE audit_log (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       entity_type TEXT NOT NULL,
@@ -339,6 +349,7 @@ function migrate(): boolean {
     CREATE INDEX idx_comments_document ON comments(document_id);
     CREATE INDEX idx_audit_entity ON audit_log(entity_type, entity_id);
     CREATE INDEX idx_closing_tasks_period ON closing_tasks(period);
+    CREATE INDEX idx_saved_views_user ON saved_views(user_id);
     CREATE INDEX idx_sessions_expires ON sessions(expires_at);
   `);
 
@@ -626,6 +637,21 @@ function seed(): void {
       insertAlloc.run(docId, payId, payMinor);
     }
   }
+
+  // Общие пресеты реестра. Заводит их главбух — они видны всей бухгалтерии.
+  const insertView = db.prepare(
+    'INSERT INTO saved_views (user_id, name, query, shared, sort, created_at) VALUES (?, ?, ?, 1, ?, ?)'
+  );
+  const sharedViews: [string, Record<string, string>][] = [
+    ['Ждут проверки', { approval: 'review' }],
+    ['Просроченные', { overdue: 'true' }],
+    ['Нет оригинала', { original: 'none' }],
+    ['Оплачено без оригинала', { payment: 'paid', original: 'none' }],
+    ['Не проведены в учёте', { approval: 'approved', posting: 'not_posted' }],
+  ];
+  sharedViews.forEach(([name, query], index) => {
+    insertView.run(uOlga, name, JSON.stringify(query), index, createdAt);
+  });
 
   // Периоды с чек-листами — по всем месяцам, в которые попали документы.
   const periods = db.prepare('SELECT DISTINCT period FROM documents ORDER BY period').all() as {

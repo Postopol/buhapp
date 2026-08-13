@@ -10,6 +10,7 @@ import type {
   DocType,
   OriginalStatus,
   PostingStatus,
+  SavedView,
   Section,
 } from '@/types';
 
@@ -93,6 +94,32 @@ export function setPostingStatus(id: number, status: PostingStatus): Promise<{ d
 
 export function addComment(id: number, body: string): Promise<{ comment: Comment }> {
   return request(`/documents/${id}/comments`, { method: 'POST', body: JSON.stringify({ body }) });
+}
+
+// ── Сохранённые фильтры ─────────────────────────────────────────────────────
+
+export function listViews(): Promise<{ views: SavedView[] }> {
+  return request('/views');
+}
+
+export function createView(data: {
+  name: string;
+  query: Record<string, string>;
+  shared?: boolean;
+}): Promise<{ view: SavedView }> {
+  return request('/views', { method: 'POST', body: JSON.stringify(data) });
+}
+
+export function renameView(id: number, name: string): Promise<{ view: SavedView }> {
+  return request(`/views/${id}`, { method: 'PATCH', body: JSON.stringify({ name }) });
+}
+
+export function updateViewQuery(id: number, query: Record<string, string>): Promise<{ view: SavedView }> {
+  return request(`/views/${id}`, { method: 'PATCH', body: JSON.stringify({ query }) });
+}
+
+export function deleteView(id: number): Promise<{ ok: boolean }> {
+  return request(`/views/${id}`, { method: 'DELETE' });
 }
 
 export function exportUrl(filters: DocumentFilters): string {

@@ -1,25 +1,48 @@
-import React from 'react';
-import { Outlet, Link, useLocation, useNavigate } from 'react-router-dom';
+import { Outlet, NavLink, useNavigate } from 'react-router-dom';
 import { useAuth } from '@/context/AuthContext';
-import type { Role } from '@/types';
-import {
-  LayoutDashboard,
-  Network,
-  FileText,
-  LogOut,
-  UserCircle
-} from 'lucide-react';
+import { LayoutDashboard, FileText, Wallet, Building2, LogOut, UserCircle, Calculator } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { ROLE_LABELS, SECTION_LABELS, type Role } from '@shared/domain';
+import { cn } from '@/lib/utils';
 
-const ROLE_LABELS: Record<Role, string> = {
-  accountant: 'Рядовой бухгалтер',
-  chief_accountant: 'Главный бухгалтер',
-  manager: 'Руководитель'
-};
+interface NavItem {
+  path: string;
+  label: string;
+  icon: typeof FileText;
+  roles: Role[];
+  end?: boolean;
+}
+
+const NAV: NavItem[] = [
+  {
+    path: '/',
+    label: 'Рабочее место',
+    icon: LayoutDashboard,
+    roles: ['initiator', 'accountant', 'chief_accountant', 'director'],
+    end: true,
+  },
+  {
+    path: '/documents',
+    label: 'Документы',
+    icon: FileText,
+    roles: ['initiator', 'accountant', 'chief_accountant', 'director'],
+  },
+  {
+    path: '/payments',
+    label: 'Оплаты',
+    icon: Wallet,
+    roles: ['accountant', 'chief_accountant'],
+  },
+  {
+    path: '/counterparties',
+    label: 'Контрагенты',
+    icon: Building2,
+    roles: ['accountant', 'chief_accountant', 'director'],
+  },
+];
 
 export function DashboardLayout() {
   const { user, role, logout } = useAuth();
-  const location = useLocation();
   const navigate = useNavigate();
 
   const handleLogout = async () => {
@@ -27,50 +50,52 @@ export function DashboardLayout() {
     navigate('/login');
   };
 
-  const navItems = [
-    { path: '/', label: 'Дашборд', icon: LayoutDashboard, roles: ['accountant', 'chief_accountant', 'manager'] },
-    { path: '/workflow', label: 'Заявки (Workflow)', icon: FileText, roles: ['accountant', 'chief_accountant', 'manager'] },
-    { path: '/integrations', label: 'Интеграции', icon: Network, roles: ['accountant', 'chief_accountant'] },
-  ];
-
-  const filteredNav = navItems.filter(item => role && item.roles.includes(role));
+  const items = NAV.filter((item) => role && item.roles.includes(role));
 
   return (
     <div className="flex h-screen w-full bg-slate-50 text-slate-900">
-      {/* Sidebar */}
-      <aside className="w-64 flex-shrink-0 border-r border-slate-200 bg-white flex flex-col">
-        <div className="h-16 flex items-center px-6 border-b border-slate-200">
-          <span className="font-bold text-lg tracking-tight text-slate-900">GovFin Portal</span>
+      <aside className="flex w-60 shrink-0 flex-col border-r border-slate-200 bg-white">
+        <div className="flex h-16 items-center gap-2 border-b border-slate-200 px-5">
+          <Calculator className="h-5 w-5 text-slate-900" />
+          <span className="text-lg font-bold tracking-tight text-slate-900">Бухгалтерия</span>
         </div>
-        <nav className="flex-1 overflow-y-auto py-4 px-3 space-y-1">
-          {filteredNav.map((item) => {
-            const isActive = location.pathname === item.path;
+
+        <nav className="flex-1 space-y-1 overflow-y-auto px-3 py-4">
+          {items.map((item) => {
             const Icon = item.icon;
             return (
-              <Link
+              <NavLink
                 key={item.path}
                 to={item.path}
-                className={`flex items-center gap-3 px-3 py-2 rounded-md transition-colors text-sm font-medium ${
-                  isActive
-                    ? 'bg-slate-100 text-slate-900'
-                    : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
-                }`}
+                end={item.end}
+                className={({ isActive }) =>
+                  cn(
+                    'flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors',
+                    isActive
+                      ? 'bg-slate-100 text-slate-900'
+                      : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
+                  )
+                }
               >
                 <Icon className="h-4 w-4" />
                 {item.label}
-              </Link>
+              </NavLink>
             );
           })}
         </nav>
-        <div className="p-4 border-t border-slate-200">
-          <div className="flex items-center gap-3 mb-4">
-            <UserCircle className="h-8 w-8 text-slate-400" />
-            <div className="flex flex-col">
-              <span className="text-sm font-medium leading-none">{user?.name ?? 'Пользователь'}</span>
-              <span className="text-xs text-slate-500 mt-1">{role ? ROLE_LABELS[role] : ''}</span>
+
+        <div className="border-t border-slate-200 p-4">
+          <div className="mb-3 flex items-center gap-3">
+            <UserCircle className="h-8 w-8 shrink-0 text-slate-300" />
+            <div className="min-w-0">
+              <div className="truncate text-sm font-medium leading-tight">{user?.name ?? 'Пользователь'}</div>
+              <div className="mt-0.5 truncate text-xs text-slate-500">
+                {role ? ROLE_LABELS[role] : ''}
+                {user?.section ? ` · ${SECTION_LABELS[user.section]}` : ''}
+                {user?.department ? ` · ${user.department}` : ''}
+              </div>
             </div>
           </div>
-
           <Button variant="outline" className="w-full justify-start text-slate-600" onClick={handleLogout}>
             <LogOut className="mr-2 h-4 w-4" />
             Выйти
@@ -78,17 +103,8 @@ export function DashboardLayout() {
         </div>
       </aside>
 
-      {/* Main Content */}
-      <main className="flex-1 flex flex-col overflow-hidden">
-        <header className="h-16 flex items-center justify-between px-8 border-b border-slate-200 bg-white">
-          <h1 className="text-lg font-semibold">
-            {filteredNav.find(n => n.path === location.pathname)?.label || 'Портал'}
-          </h1>
-          <div className="flex items-center gap-4">
-            {/* Header actions could go here */}
-          </div>
-        </header>
-        <div className="flex-1 overflow-auto p-8">
+      <main className="flex flex-1 flex-col overflow-hidden">
+        <div className="flex-1 overflow-auto p-6 lg:p-8">
           <Outlet />
         </div>
       </main>

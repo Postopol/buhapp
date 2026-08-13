@@ -1,26 +1,31 @@
 import express from 'express';
 import { corsMiddleware } from './auth';
 import { authRouter } from './routes/auth';
-import { requestsRouter } from './routes/requests';
-import { integrationsRouter } from './routes/integrations';
-import { dashboardRouter } from './routes/dashboard';
+import { documentsRouter } from './routes/documents';
+import { counterpartiesRouter } from './routes/counterparties';
+import { paymentsRouter } from './routes/payments';
+import { workspaceRouter } from './routes/workspace';
+import { attachmentsRouter } from './routes/attachments';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
 app.use(corsMiddleware);
-app.use(express.json());
+// Вложения приходят как base64 внутри JSON — лимит по умолчанию (100 КБ) мал.
+app.use(express.json({ limit: '25mb' }));
 
 app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok' });
 });
 
 app.use('/api/auth', authRouter);
-app.use('/api/requests', requestsRouter);
-app.use('/api/integrations', integrationsRouter);
-app.use('/api/dashboard', dashboardRouter);
+app.use('/api/documents', documentsRouter);
+app.use('/api/counterparties', counterpartiesRouter);
+app.use('/api/payments', paymentsRouter);
+app.use('/api/workspace', workspaceRouter);
+app.use('/api/attachments', attachmentsRouter);
 
-app.use((req, res) => {
+app.use((_req, res) => {
   res.status(404).json({ error: 'Маршрут не найден' });
 });
 
@@ -30,5 +35,5 @@ app.use((err: Error, _req: express.Request, res: express.Response, _next: expres
 });
 
 app.listen(PORT, () => {
-  console.log(`GovFin API запущен на http://localhost:${PORT}`);
+  console.log(`API бухотдела запущен на http://localhost:${PORT}`);
 });

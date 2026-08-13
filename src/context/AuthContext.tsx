@@ -1,14 +1,14 @@
-import React, { createContext, useContext, useState, ReactNode, useEffect, useCallback } from 'react';
+import { createContext, useContext, useState, type ReactNode, useEffect, useCallback } from 'react';
 import type { User, Role } from '@/types';
 import { login as apiLogin, logout as apiLogout, me as apiMe } from '@/services/auth';
-import { getToken, setToken, clearToken } from '@/services/api';
+import { getToken, setToken, clearToken, onUnauthorized } from '@/services/api';
 
 interface AuthContextType {
   user: User | null;
   role: Role | null;
   isAuthenticated: boolean;
   loading: boolean;
-  login: (iin: string, password: string) => Promise<void>;
+  login: (email: string, password: string) => Promise<void>;
   logout: () => Promise<void>;
 }
 
@@ -33,8 +33,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       .finally(() => setLoading(false));
   }, []);
 
-  const login = useCallback(async (iin: string, password: string) => {
-    const { token, user } = await apiLogin(iin, password);
+  // Любой 401 из любого запроса разлогинивает приложение, а не только чистит токен.
+  useEffect(() => {
+    onUnauthorized(() => setUser(null));
+    return () => onUnauthorized(null);
+  }, []);
+
+  const login = useCallback(async (email: string, password: string) => {
+    const { token, user } = await apiLogin(email, password);
     setToken(token);
     setUser(user);
   }, []);

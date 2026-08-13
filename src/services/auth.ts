@@ -6,10 +6,10 @@ export interface LoginResponse {
   user: User;
 }
 
-export function login(iin: string, password: string): Promise<LoginResponse> {
+export function login(email: string, password: string): Promise<LoginResponse> {
   return request<LoginResponse>('/auth/login', {
     method: 'POST',
-    body: JSON.stringify({ iin, password }),
+    body: JSON.stringify({ email, password }),
   });
 }
 

@@ -1,29 +1,25 @@
-/**
- * @license
- * SPDX-License-Identifier: Apache-2.0
- */
-
-import React from 'react';
+import type { ReactNode } from 'react';
 import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
 import { AuthProvider, useAuth } from '@/context/AuthContext';
 import { DashboardLayout } from '@/layouts/DashboardLayout';
 import { Login } from '@/pages/Login';
-import { Dashboard } from '@/pages/Dashboard';
-import { Integrations } from '@/pages/Integrations';
-import { Workflow } from '@/pages/Workflow';
+import { Workspace } from '@/pages/Workspace';
+import { Documents } from '@/pages/Documents';
+import { DocumentDetail } from '@/pages/DocumentDetail';
+import { Counterparties } from '@/pages/Counterparties';
+import { CounterpartyDetail } from '@/pages/CounterpartyDetail';
+import { Payments } from '@/pages/Payments';
 
-function ProtectedRoute({ children }: { children: React.ReactNode }) {
+function ProtectedRoute({ children }: { children: ReactNode }) {
   const { isAuthenticated, loading } = useAuth();
   if (loading) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-slate-50">
+      <div className="flex min-h-screen items-center justify-center bg-slate-50">
         <div className="text-slate-400">Загрузка…</div>
       </div>
     );
   }
-  if (!isAuthenticated) {
-    return <Navigate to="/login" replace />;
-  }
+  if (!isAuthenticated) return <Navigate to="/login" replace />;
   return <>{children}</>;
 }
 
@@ -39,9 +35,14 @@ function AppRoutes() {
           </ProtectedRoute>
         }
       >
-        <Route index element={<Dashboard />} />
-        <Route path="integrations" element={<Integrations />} />
-        <Route path="workflow" element={<Workflow />} />
+        <Route index element={<Workspace />} />
+        <Route path="documents" element={<Documents />} />
+        {/* Отдельный URL у документа: ссылку можно отправить, F5 не теряет контекст */}
+        <Route path="documents/:id" element={<DocumentDetail />} />
+        <Route path="counterparties" element={<Counterparties />} />
+        <Route path="counterparties/:id" element={<CounterpartyDetail />} />
+        <Route path="payments" element={<Payments />} />
+        <Route path="*" element={<Navigate to="/" replace />} />
       </Route>
     </Routes>
   );

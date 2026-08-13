@@ -141,6 +141,62 @@ export const TRANSITIONS: Record<ApprovalStatus, ApprovalTransition[]> = {
  */
 export const CHIEF_APPROVAL_THRESHOLD = 1_000_000 * 100;
 
+// ── Закрытие периода ────────────────────────────────────────────────────────
+
+export type PeriodStatus = 'open' | 'closed';
+
+export const PERIOD_STATUS_LABELS: Record<PeriodStatus, string> = {
+  open: 'Открыт',
+  closed: 'Закрыт',
+};
+
+/**
+ * Чек-лист закрытия месяца. Создаётся для каждого периода при первом открытии,
+ * ответственный подставляется по участку.
+ */
+export const CLOSING_TASK_TEMPLATE: { title: string; hint: string; section: Section | null }[] = [
+  {
+    title: 'Вся первичка получена и заведена',
+    hint: 'Счета, акты и накладные за период есть в системе',
+    section: 'suppliers',
+  },
+  {
+    title: 'Банковские выписки загружены и разнесены',
+    hint: 'Каждое движение по счёту привязано к документу',
+    section: 'bank',
+  },
+  {
+    title: 'Расчёты с подотчётными лицами закрыты',
+    hint: 'Авансовые отчёты сданы, остатки возвращены',
+    section: 'bank',
+  },
+  {
+    title: 'Зарплата начислена и проведена',
+    hint: 'ИПН, ОПВ, СО и ВОСМС рассчитаны',
+    section: 'payroll',
+  },
+  {
+    title: 'Амортизация начислена',
+    hint: 'По всем основным средствам и НМА',
+    section: 'inventory',
+  },
+  {
+    title: 'Движение ТМЗ проведено',
+    hint: 'Поступление и списание материалов закрыты',
+    section: 'inventory',
+  },
+  {
+    title: 'Акты сверки с ключевыми контрагентами',
+    hint: 'Расхождения найдены и разобраны',
+    section: 'suppliers',
+  },
+  {
+    title: 'НДС проверен, реестр счетов-фактур сверен',
+    hint: 'Зачётный и начисленный НДС сходятся',
+    section: 'tax',
+  },
+];
+
 // ── Прочее ──────────────────────────────────────────────────────────────────
 
 export const VAT_RATE = 0.12;

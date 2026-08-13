@@ -4,7 +4,7 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/com
 import { Button } from '@/components/ui/button';
 import {
   ArrowLeft, Loader2, Paperclip, Trash2, Download, Send, CheckCheck, Undo2, Ban,
-  MessageSquare, History, Pencil, Building2, AlertTriangle, RotateCcw,
+  MessageSquare, History, Pencil, Building2, AlertTriangle, RotateCcw, Lock,
 } from 'lucide-react';
 import { useAuth } from '@/context/AuthContext';
 import {
@@ -107,16 +107,21 @@ export function DocumentDetail() {
     );
   }
 
-  const available = (TRANSITIONS[doc.approvalStatus] ?? []).filter((t) => role && t.roles.includes(role));
+  // Закрытый период замораживает документ целиком: ни действий, ни правок.
+  const frozen = doc.periodClosed;
+  const available = frozen
+    ? []
+    : (TRANSITIONS[doc.approvalStatus] ?? []).filter((t) => role && t.roles.includes(role));
   const needsChief =
     doc.amount >= CHIEF_APPROVAL_THRESHOLD && role === 'accountant';
   const due = dueLabel(doc.dueDate);
   const outstanding = doc.amount - doc.paid;
   const canEdit =
+    !frozen &&
     role !== 'director' &&
     !(doc.approvalStatus === 'approved' && role !== 'chief_accountant') &&
     !(doc.approvalStatus === 'review' && role === 'initiator');
-  const isAccounting = role === 'accountant' || role === 'chief_accountant';
+  const isAccounting = !frozen && (role === 'accountant' || role === 'chief_accountant');
 
   const runTransition = async (to: ApprovalStatus, comment: string) => {
     setActionError('');
@@ -246,6 +251,16 @@ export function DocumentDetail() {
           })}
         </div>
       </div>
+
+      {frozen && (
+        <div className="flex items-center gap-3 rounded-lg border border-slate-300 bg-slate-100 px-4 py-3 text-sm text-slate-700">
+          <Lock className="h-4 w-4 shrink-0 text-slate-500" />
+          <span>
+            Период {formatPeriod(doc.period)} закрыт — документ заморожен. Чтобы внести изменения,
+            главный бухгалтер должен открыть период заново.
+          </span>
+        </div>
+      )}
 
       {needsChief && doc.approvalStatus === 'review' && (
         <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">

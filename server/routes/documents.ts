@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { db, nowTimestamp, today, logAudit } from '../db';
+import { db, nowTimestamp, today, logAudit, isPeriodClosed, ensurePeriod } from '../db';
 import { requireAuth } from '../auth';
 import type { AuthUser } from '../auth';
 import {
@@ -133,6 +133,7 @@ function mapDoc(row: DocRow) {
     attachmentsCount: row.attachments_count,
     commentsCount: row.comments_count,
     overdue: isOverdue(row),
+    periodClosed: isPeriodClosed(row.period),
   };
 }
 
@@ -340,6 +341,13 @@ function canSee(row: DocRow, user: AuthUser): boolean {
   return true;
 }
 
+/** Закрытый период не меняется — иначе отчётность разъедется с учётом. */
+const PERIOD_LOCKED = 'Период закрыт — документ изменить нельзя. Обратитесь к главному бухгалтеру.';
+
+function periodLocked(row: DocRow): boolean {
+  return isPeriodClosed(row.period);
+}
+
 documentsRouter.get('/:id(\\d+)', (req, res) => {
   const row = loadDoc(Number(req.params.id));
   if (!row || !canSee(row, req.user!)) {
@@ -469,6 +477,13 @@ documentsRouter.post('/', (req, res) => {
     res.status(400).json({ error });
     return;
   }
+  const period = body.docDate!.slice(0, 7);
+  if (isPeriodClosed(period)) {
+    res.status(409).json({ error: `Период ${period} закрыт — документ этой датой завести нельзя` });
+    return;
+  }
+  ensurePeriod(period);
+
   const user = req.user!;
   const ts = nowTimestamp();
 
@@ -495,7 +510,7 @@ documentsRouter.post('/', (req, res) => {
       body.number!.trim(),
       body.docDate,
       body.dueDate || null,
-      body.docDate!.slice(0, 7),
+      period,
       body.counterpartyId ?? null,
       body.contractId ?? null,
       body.expenseItemId ?? null,
@@ -531,6 +546,11 @@ documentsRouter.patch('/:id(\\d+)', (req, res) => {
   }
   const user = req.user!;
 
+  if (periodLocked(row)) {
+    res.status(409).json({ error: PERIOD_LOCKED });
+    return;
+  }
+
   // Согласованный документ правит только главбух — иначе подпись теряет смысл.
   if (row.approval_status === 'approved' && user.role !== 'chief_accountant') {
     res.status(403).json({ error: 'Согласованный документ может изменить только главный бухгалтер' });
@@ -564,7 +584,16 @@ documentsRouter.patch('/:id(\\d+)', (req, res) => {
   assign('purpose', body.purpose?.trim());
   assign('section', body.section);
   assign('responsible_user_id', body.responsibleId);
-  if (body.docDate) fields.period = body.docDate.slice(0, 7);
+  if (body.docDate) {
+    const newPeriod = body.docDate.slice(0, 7);
+    // Перенос датой в уже закрытый месяц — тот же обход блокировки.
+    if (newPeriod !== row.period && isPeriodClosed(newPeriod)) {
+      res.status(409).json({ error: `Период ${newPeriod} закрыт — перенести документ туда нельзя` });
+      return;
+    }
+    ensurePeriod(newPeriod);
+    fields.period = newPeriod;
+  }
 
   const keys = Object.keys(fields);
   if (keys.length === 0) {
@@ -595,6 +624,7 @@ documentsRouter.patch('/:id(\\d+)', (req, res) => {
  * Одна функция и для одиночного действия, и для массового.
  */
 function checkTransition(row: DocRow, to: ApprovalStatus, comment: string, user: AuthUser): string | null {
+  if (periodLocked(row)) return PERIOD_LOCKED;
   const transition = TRANSITIONS[row.approval_status]?.find((t) => t.to === to);
   if (!transition) {
     return `Из состояния «${APPROVAL_LABELS[row.approval_status]}» такой переход невозможен`;
@@ -705,6 +735,10 @@ documentsRouter.post('/:id(\\d+)/original', (req, res) => {
     return;
   }
   const user = req.user!;
+  if (periodLocked(row)) {
+    res.status(409).json({ error: PERIOD_LOCKED });
+    return;
+  }
   if (user.role === 'initiator') {
     res.status(403).json({ error: 'Статус оригинала ведёт бухгалтерия' });
     return;
@@ -737,6 +771,10 @@ documentsRouter.post('/:id(\\d+)/posting', (req, res) => {
     return;
   }
   const user = req.user!;
+  if (periodLocked(row)) {
+    res.status(409).json({ error: PERIOD_LOCKED });
+    return;
+  }
   if (user.role === 'initiator' || user.role === 'director') {
     res.status(403).json({ error: 'Проводит документы бухгалтерия' });
     return;

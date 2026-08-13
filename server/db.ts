@@ -3,6 +3,7 @@ import { scryptSync, randomBytes, timingSafeEqual } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import {
+  CLOSING_TASK_TEMPLATE,
   type ApprovalStatus,
   type DocType,
   type OriginalStatus,
@@ -26,7 +27,7 @@ db.pragma('foreign_keys = ON');
  * Версия схемы. При несовпадении база пересоздаётся целиком —
  * прежняя схема госоргана (requests / ifp_data / integrations) несовместима.
  */
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 // ── Пароли ──────────────────────────────────────────────────────────────────
 
@@ -97,6 +98,47 @@ export function logAudit(params: {
     params.details === undefined ? null : JSON.stringify(params.details),
     nowTimestamp()
   );
+}
+
+// ── Периоды ─────────────────────────────────────────────────────────────────
+
+/**
+ * Периоды заводятся лениво: при первом обращении к месяцу создаётся строка
+ * и чек-лист из шаблона. Ответственный подставляется по участку задачи.
+ */
+export function ensurePeriod(period: string): void {
+  const exists = db.prepare('SELECT period FROM periods WHERE period = ?').get(period);
+  if (exists) return;
+
+  const tx = db.transaction(() => {
+    db.prepare(`INSERT INTO periods (period, status, created_at) VALUES (?, 'open', ?)`).run(
+      period,
+      nowTimestamp()
+    );
+    const insertTask = db.prepare(
+      `INSERT INTO closing_tasks (period, sort, title, hint, responsible_user_id)
+       VALUES (?, ?, ?, ?, ?)`
+    );
+    const bySection = db.prepare(
+      `SELECT id FROM users WHERE section = ? AND role = 'accountant' ORDER BY id LIMIT 1`
+    );
+    const chief = db.prepare(`SELECT id FROM users WHERE role = 'chief_accountant' ORDER BY id LIMIT 1`).get() as
+      | { id: number }
+      | undefined;
+
+    CLOSING_TASK_TEMPLATE.forEach((task, index) => {
+      const owner = task.section ? (bySection.get(task.section) as { id: number } | undefined) : undefined;
+      insertTask.run(period, index, task.title, task.hint, owner?.id ?? chief?.id ?? null);
+    });
+  });
+  tx();
+}
+
+export function isPeriodClosed(period: string): boolean {
+  const row = db.prepare('SELECT status FROM periods WHERE period = ?').get(period) as
+    | { status: string }
+    | undefined;
+  return row?.status === 'closed';
 }
 
 // ── Схема ───────────────────────────────────────────────────────────────────
@@ -240,6 +282,27 @@ function migrate(): boolean {
       created_at TEXT NOT NULL
     );
 
+    CREATE TABLE periods (
+      period TEXT PRIMARY KEY,
+      status TEXT NOT NULL CHECK(status IN ('open','closed')) DEFAULT 'open',
+      closed_at TEXT,
+      closed_by INTEGER REFERENCES users(id),
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE closing_tasks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      period TEXT NOT NULL REFERENCES periods(period) ON DELETE CASCADE,
+      sort INTEGER NOT NULL,
+      title TEXT NOT NULL,
+      hint TEXT NOT NULL DEFAULT '',
+      responsible_user_id INTEGER REFERENCES users(id),
+      done INTEGER NOT NULL DEFAULT 0,
+      done_at TEXT,
+      done_by INTEGER REFERENCES users(id),
+      note TEXT NOT NULL DEFAULT ''
+    );
+
     CREATE TABLE audit_log (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       entity_type TEXT NOT NULL,
@@ -262,6 +325,7 @@ function migrate(): boolean {
     CREATE INDEX idx_attachments_document ON attachments(document_id);
     CREATE INDEX idx_comments_document ON comments(document_id);
     CREATE INDEX idx_audit_entity ON audit_log(entity_type, entity_id);
+    CREATE INDEX idx_closing_tasks_period ON closing_tasks(period);
     CREATE INDEX idx_sessions_expires ON sessions(expires_at);
   `);
 
@@ -549,6 +613,13 @@ function seed(): void {
       insertAlloc.run(docId, payId, payMinor);
     }
   }
+
+  // Периоды с чек-листами — по всем месяцам, в которые попали документы.
+  const periods = db.prepare('SELECT DISTINCT period FROM documents ORDER BY period').all() as {
+    period: string;
+  }[];
+  for (const p of periods) ensurePeriod(p.period);
+  ensurePeriod(currentPeriod());
 
   logAudit({
     entityType: 'system',

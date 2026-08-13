@@ -6,6 +6,7 @@ import { counterpartiesRouter } from './routes/counterparties';
 import { paymentsRouter } from './routes/payments';
 import { workspaceRouter } from './routes/workspace';
 import { attachmentsRouter } from './routes/attachments';
+import { periodsRouter } from './routes/periods';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -24,6 +25,7 @@ app.use('/api/counterparties', counterpartiesRouter);
 app.use('/api/payments', paymentsRouter);
 app.use('/api/workspace', workspaceRouter);
 app.use('/api/attachments', attachmentsRouter);
+app.use('/api/periods', periodsRouter);
 
 app.use((_req, res) => {
   res.status(404).json({ error: 'Маршрут не найден' });

@@ -5,6 +5,8 @@ import type {
   Dictionaries,
   PayableDocument,
   Payment,
+  PeriodDetail,
+  PeriodSummaryRow,
   Workspace,
 } from '@/types';
 
@@ -16,6 +18,28 @@ export function getWorkspace(): Promise<Workspace> {
 
 export function getDictionaries(): Promise<Dictionaries> {
   return request('/workspace/dictionaries');
+}
+
+// ── Закрытие периода ────────────────────────────────────────────────────────
+
+export function listPeriods(): Promise<{ periods: PeriodSummaryRow[]; current: string }> {
+  return request('/periods');
+}
+
+export function getPeriod(period: string): Promise<{ period: PeriodDetail }> {
+  return request(`/periods/${period}`);
+}
+
+export function toggleClosingTask(period: string, taskId: number): Promise<{ period: PeriodDetail }> {
+  return request(`/periods/${period}/tasks/${taskId}/toggle`, { method: 'POST' });
+}
+
+export function closePeriod(period: string): Promise<{ period: PeriodDetail }> {
+  return request(`/periods/${period}/close`, { method: 'POST' });
+}
+
+export function reopenPeriod(period: string, reason: string): Promise<{ period: PeriodDetail }> {
+  return request(`/periods/${period}/reopen`, { method: 'POST', body: JSON.stringify({ reason }) });
 }
 
 // ── Контрагенты ─────────────────────────────────────────────────────────────

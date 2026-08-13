@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { db, nowTimestamp, logAudit } from '../db';
+import { db, nowTimestamp, logAudit, isPeriodClosed } from '../db';
 import { requireAuth, requireRole } from '../auth';
 import { PAYABLE_TYPES } from '../../shared/domain';
 
@@ -195,16 +195,20 @@ paymentsRouter.post('/', (req, res) => {
 
     const doc = db
       .prepare(
-        `SELECT d.id, d.number, d.amount_minor, d.approval_status,
+        `SELECT d.id, d.number, d.amount_minor, d.approval_status, d.period,
                 COALESCE((SELECT SUM(dp.amount_minor) FROM document_payments dp WHERE dp.document_id = d.id), 0) AS paid
          FROM documents d WHERE d.id = ?`
       )
       .get(a.documentId) as
-      | { id: number; number: string; amount_minor: number; approval_status: string; paid: number }
+      | { id: number; number: string; amount_minor: number; approval_status: string; period: string; paid: number }
       | undefined;
 
     if (!doc) {
       res.status(400).json({ error: `Документ #${a.documentId} не найден` });
+      return;
+    }
+    if (isPeriodClosed(doc.period)) {
+      res.status(409).json({ error: `Документ ${doc.number} в закрытом периоде ${doc.period} — оплату разнести нельзя` });
       return;
     }
     if (doc.approval_status !== 'approved') {

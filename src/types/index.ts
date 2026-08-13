@@ -53,6 +53,7 @@ export interface Document {
   attachmentsCount: number;
   commentsCount: number;
   overdue: boolean;
+  periodClosed: boolean;
 }
 
 export interface Attachment {
@@ -86,6 +87,53 @@ export interface DocumentPayment {
   reference: string;
   bankAccount: string;
   amount: number;
+}
+
+export interface ClosingBlocker {
+  key: string;
+  title: string;
+  hint: string;
+  count: number;
+  amount: number;
+  filter: Record<string, string>;
+}
+
+export interface ClosingTask {
+  id: number;
+  title: string;
+  hint: string;
+  responsibleId: number | null;
+  responsibleName: string | null;
+  done: boolean;
+  doneAt: string | null;
+  doneByName: string | null;
+  note: string;
+}
+
+export interface PeriodDetail {
+  period: string;
+  status: 'open' | 'closed';
+  statusLabel: string;
+  closedAt: string | null;
+  closedByName: string | null;
+  documents: number;
+  amount: number;
+  vat: number;
+  blockers: ClosingBlocker[];
+  blockingCount: number;
+  tasks: ClosingTask[];
+  tasksDone: number;
+  tasksTotal: number;
+  canClose: boolean;
+}
+
+export interface PeriodSummaryRow {
+  period: string;
+  status: 'open' | 'closed';
+  closedAt: string | null;
+  documents: number;
+  tasksDone: number;
+  tasksTotal: number;
 }
 
 export interface DocumentDetail extends Document {

@@ -158,6 +158,15 @@ export function Workspace() {
                 Период нельзя закрыть, пока остаются непроведённые документы и недостающие оригиналы.
               </p>
             )}
+            {user?.role !== 'initiator' && (
+              <Link
+                to={`/closing?period=${data.period.period}`}
+                className="inline-flex items-center gap-1 pt-1 text-xs font-medium text-slate-600 hover:text-slate-900"
+              >
+                Закрытие месяца
+                <ArrowRight className="h-3 w-3" />
+              </Link>
+            )}
           </CardContent>
         </Card>
 

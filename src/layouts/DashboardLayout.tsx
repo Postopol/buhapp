@@ -2,7 +2,7 @@ import { Outlet, NavLink, useNavigate } from 'react-router-dom';
 import { useAuth } from '@/context/AuthContext';
 import {
   LayoutDashboard, FileText, Wallet, Building2, CalendarCheck, CalendarClock,
-  LogOut, UserCircle, Calculator,
+  LogOut, UserCircle, Calculator, Scale,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { ROLE_LABELS, SECTION_LABELS, type Role } from '@shared/domain';
@@ -40,6 +40,14 @@ const NAV: NavItem[] = [
     path: '/counterparties',
     label: 'Контрагенты',
     icon: Building2,
+    roles: ['accountant', 'chief_accountant', 'director'],
+  },
+  {
+    // Роли обязаны совпадать с requireRole в роутере, иначе пункт есть,
+    // а страница отдаёт 403.
+    path: '/reconciliations',
+    label: 'Акты сверки',
+    icon: Scale,
     roles: ['accountant', 'chief_accountant', 'director'],
   },
   {

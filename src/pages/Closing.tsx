@@ -7,11 +7,12 @@ import {
 } from 'lucide-react';
 import { useAuth } from '@/context/AuthContext';
 import { listPeriods, getPeriod, toggleClosingTask, closePeriod, reopenPeriod } from '@/services/directory';
+import { getReconciliationSummary } from '@/services/reconciliations';
 import { ApiError } from '@/services/api';
 import { formatMoneyShort, formatPeriod, formatDateTime, plural } from '@/lib/format';
 import { Chip } from '@/components/StatusChips';
 import { cn } from '@/lib/utils';
-import type { PeriodDetail, PeriodSummaryRow } from '@/types';
+import type { PeriodDetail, PeriodSummaryRow, ReconciliationSummary } from '@/types';
 
 export function Closing() {
   const { role } = useAuth();
@@ -26,6 +27,7 @@ export function Closing() {
   const [busy, setBusy] = useState(false);
   const [showReopen, setShowReopen] = useState(false);
   const [reopenReason, setReopenReason] = useState('');
+  const [reconSummary, setReconSummary] = useState<ReconciliationSummary | null>(null);
 
   const selected = params.get('period');
 
@@ -53,6 +55,19 @@ export function Closing() {
   useEffect(() => {
     load();
   }, [load]);
+
+  // Сводка по сверке — справочная: не грузим её вместе с периодом и молча
+  // прячем при ошибке, чтобы экран закрытия от неё не зависел.
+  useEffect(() => {
+    if (!selected) return;
+    let cancelled = false;
+    getReconciliationSummary(selected)
+      .then((res) => !cancelled && setReconSummary(res.summary))
+      .catch(() => !cancelled && setReconSummary(null));
+    return () => {
+      cancelled = true;
+    };
+  }, [selected]);
 
   const isChief = role === 'chief_accountant';
   const canEdit = role === 'accountant' || role === 'chief_accountant';
@@ -305,6 +320,35 @@ export function Closing() {
                 )}
               </button>
             ))}
+
+            {/* Сводка по сверке — подсказка к пункту «Акты сверки», а не
+                блокировка: молчащий контрагент не должен держать закрытие. */}
+            {reconSummary && (
+              <div className="mt-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2.5 text-sm">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="font-medium text-slate-900">
+                      {reconSummary.total === 0
+                        ? 'Актов сверки за месяц нет'
+                        : `${plural(reconSummary.total, 'акт сверки', 'акта сверки', 'актов сверки')}: подписано ${reconSummary.signed}, отправлено ${reconSummary.sent}, с расхождениями ${reconSummary.disputed}`}
+                    </div>
+                    {reconSummary.debtorsWithoutAct > 0 && (
+                      <div className="mt-0.5 text-xs text-slate-500">
+                        Контрагентов с долгом и без акта: {reconSummary.debtorsWithoutAct}
+                      </div>
+                    )}
+                  </div>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="shrink-0"
+                    onClick={() => navigate(`/reconciliations?period=${detail.period}`)}
+                  >
+                    Открыть
+                  </Button>
+                </div>
+              </div>
+            )}
           </CardContent>
         </Card>
       </div>

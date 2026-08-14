@@ -103,14 +103,17 @@ export const POSTING_LABELS: Record<PostingStatus, string> = {
 
 // ── Маршрут согласования ────────────────────────────────────────────────────
 
-export interface ApprovalTransition {
+/** Переход по маршруту. Параметризован статусом: маршрут есть и у документа, и у акта сверки. */
+export interface Transition<S extends string> {
   /** Что написано на кнопке. */
   label: string;
-  to: ApprovalStatus;
+  to: S;
   roles: Role[];
   /** Требует комментария (причины). */
   requiresComment?: boolean;
 }
+
+export type ApprovalTransition = Transition<ApprovalStatus>;
 
 /**
  * Маршрут не линейный: из «на проверке» есть три выхода, и это главное
@@ -196,6 +199,85 @@ export const CLOSING_TASK_TEMPLATE: { title: string; hint: string; section: Sect
     section: 'tax',
   },
 ];
+
+// ── Акты сверки ─────────────────────────────────────────────────────────────
+
+export type ReconciliationStatus = 'draft' | 'sent' | 'signed' | 'disputed' | 'cancelled';
+
+export const RECONCILIATION_STATUS_LABELS: Record<ReconciliationStatus, string> = {
+  draft: 'Черновик',
+  sent: 'Отправлен контрагенту',
+  signed: 'Подписан',
+  disputed: 'Расхождения',
+  cancelled: 'Аннулирован',
+};
+
+export type ReconciliationLineKind = 'document' | 'payment' | 'their';
+
+export const RECONCILIATION_LINE_LABELS: Record<ReconciliationLineKind, string> = {
+  document: 'Документ',
+  payment: 'Оплата',
+  their: 'Данные контрагента',
+};
+
+/** Диагноз по строке после сопоставления с данными контрагента. */
+export type LineMatch = 'unknown' | 'match' | 'amount_diff' | 'only_ours' | 'only_theirs';
+
+export const LINE_MATCH_LABELS: Record<LineMatch, string> = {
+  unknown: 'Не сверяли',
+  match: 'Сходится',
+  amount_diff: 'Разные суммы',
+  only_ours: 'Нет у контрагента',
+  only_theirs: 'Нет у нас',
+};
+
+/**
+ * Жизненный цикл акта. Таблица объявлена так же, как маршрут документа:
+ * права и обязательность причины живут в данных, а не в ветвлениях кода.
+ */
+export type ReconciliationTransition = Transition<ReconciliationStatus>;
+
+export const RECONCILIATION_TRANSITIONS: Record<ReconciliationStatus, ReconciliationTransition[]> = {
+  draft: [
+    { label: 'Отправить контрагенту', to: 'sent', roles: ['accountant', 'chief_accountant'] },
+    { label: 'Аннулировать', to: 'cancelled', roles: ['chief_accountant'], requiresComment: true },
+  ],
+  sent: [
+    { label: 'Подписан обеими сторонами', to: 'signed', roles: ['chief_accountant'] },
+    { label: 'Зафиксировать расхождения', to: 'disputed', roles: ['accountant', 'chief_accountant'], requiresComment: true },
+    { label: 'Аннулировать', to: 'cancelled', roles: ['chief_accountant'], requiresComment: true },
+  ],
+  disputed: [
+    { label: 'Отправить исправленный', to: 'sent', roles: ['accountant', 'chief_accountant'] },
+    { label: 'Подписан с протоколом', to: 'signed', roles: ['chief_accountant'], requiresComment: true },
+    { label: 'Аннулировать', to: 'cancelled', roles: ['chief_accountant'], requiresComment: true },
+  ],
+  signed: [
+    // Зеркало «отозвать согласование» у документа: подпись снимает только главбух.
+    { label: 'Отозвать подпись', to: 'sent', roles: ['chief_accountant'], requiresComment: true },
+  ],
+  cancelled: [],
+};
+
+/**
+ * Расхождение крупнее этого закрывает как «разобрано» только главбух —
+ * перекличка с порогом согласования документа.
+ * ВНИМАНИЕ: в тиынах, как и все суммы в системе.
+ */
+export const RECON_ACCEPT_THRESHOLD = 50_000 * 100;
+
+/** Больше строк за раз из письма не принимаем — это уже выгрузка, а не сверка. */
+export const MAX_IMPORT_LINES = 500;
+
+/**
+ * Реквизиты своей стороны для печатной формы. В системе одна организация,
+ * отдельного справочника под неё нет — при внедрении он появится, и акт
+ * станет первым его потребителем.
+ */
+export const OUR_COMPANY = {
+  name: 'ТОО «Компания»',
+  bin: '000000000000',
+};
 
 // ── Налоговый календарь ─────────────────────────────────────────────────────
 

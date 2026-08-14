@@ -3,7 +3,7 @@ import { useParams, useNavigate, Link } from 'react-router-dom';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
-import { ArrowLeft, Loader2, AlertTriangle, FileText } from 'lucide-react';
+import { ArrowLeft, Loader2, AlertTriangle, FileText, Scale } from 'lucide-react';
 import { getCounterparty } from '@/services/directory';
 import { listDocuments } from '@/services/documents';
 import { formatMoney, formatMoneyShort, formatDate, formatAmount } from '@/lib/format';
@@ -75,13 +75,21 @@ export function CounterpartyDetail() {
         <Button variant="ghost" size="icon" onClick={() => navigate('/counterparties')} title="Назад">
           <ArrowLeft className="h-5 w-5" />
         </Button>
-        <div>
+        <div className="flex-1">
           <div className="flex flex-wrap items-center gap-2">
             <h2 className="text-2xl font-bold tracking-tight text-slate-900">{cp.name}</h2>
             {!cp.isVatPayer && <Chip tone="neutral">без НДС</Chip>}
           </div>
           <p className="font-mono text-sm text-slate-500">БИН/ИИН {cp.bin}</p>
         </div>
+        <Button
+          variant="outline"
+          className="gap-2"
+          onClick={() => navigate(`/reconciliations?counterparty=${cp.id}`)}
+        >
+          <Scale className="h-4 w-4" />
+          Акты сверки
+        </Button>
       </div>
 
       {/* Сальдо — то, ради чего эту карточку открывают */}

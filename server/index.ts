@@ -9,6 +9,7 @@ import { attachmentsRouter } from './routes/attachments';
 import { periodsRouter } from './routes/periods';
 import { taxesRouter } from './routes/taxes';
 import { viewsRouter } from './routes/views';
+import { reconciliationsRouter } from './routes/reconciliations';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -30,6 +31,7 @@ app.use('/api/attachments', attachmentsRouter);
 app.use('/api/periods', periodsRouter);
 app.use('/api/taxes', taxesRouter);
 app.use('/api/views', viewsRouter);
+app.use('/api/reconciliations', reconciliationsRouter);
 
 app.use((_req, res) => {
   res.status(404).json({ error: 'Маршрут не найден' });

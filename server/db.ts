@@ -2,6 +2,10 @@ import Database from 'better-sqlite3';
 import { scryptSync, randomBytes, timingSafeEqual } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+// Циклический импорт: reconciliation.ts берёт отсюда `db`, но трогает его
+// только внутри функций — к моменту вызова из seed() он уже создан. Считать
+// снимок здесь своим SQL было бы шестой копией арифметики сальдо.
+import { statement } from './reconciliation';
 import {
   CLOSING_TASK_TEMPLATE,
   type ApprovalStatus,
@@ -33,12 +37,11 @@ db.function('rulower', { deterministic: true }, (value: unknown) =>
   typeof value === 'string' ? value.toLowerCase() : null
 );
 
-
 /**
  * Версия схемы. При несовпадении база пересоздаётся целиком —
  * прежняя схема госоргана (requests / ifp_data / integrations) несовместима.
  */
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 6;
 
 // ── Пароли ──────────────────────────────────────────────────────────────────
 
@@ -85,6 +88,15 @@ function shiftDays(days: number): string {
 
 function periodOf(date: string): string {
   return date.slice(0, 7);
+}
+
+/** Границы месяца, отстоящего на `back` месяцев назад: с 1-го по последнее число. */
+function monthRange(back: number): { from: string; to: string; period: string } {
+  const d = new Date();
+  const first = new Date(d.getFullYear(), d.getMonth() - back, 1);
+  const last = new Date(d.getFullYear(), d.getMonth() - back + 1, 0);
+  const iso = (x: Date) => `${x.getFullYear()}-${pad(x.getMonth() + 1)}-${pad(x.getDate())}`;
+  return { from: iso(first), to: iso(last), period: iso(first).slice(0, 7) };
 }
 
 // ── Аудит ───────────────────────────────────────────────────────────────────
@@ -337,6 +349,75 @@ function migrate(): boolean {
       created_at TEXT NOT NULL
     );
 
+    CREATE TABLE reconciliations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      number TEXT NOT NULL UNIQUE,
+      counterparty_id INTEGER NOT NULL REFERENCES counterparties(id) ON DELETE CASCADE,
+      date_from TEXT NOT NULL,
+      date_to TEXT NOT NULL,
+      status TEXT NOT NULL
+        CHECK(status IN ('draft','sent','signed','disputed','cancelled')) DEFAULT 'draft',
+      -- Снимок расчёта на момент формирования. Пересчитывать акт задним числом
+      -- нельзя: подписанный документ обязан показывать те же цифры, что ушли
+      -- контрагенту, даже если первичку потом поправили. CHECK(>0) здесь
+      -- нарочно нет — сальдо уходит в минус при переплате.
+      opening_minor INTEGER NOT NULL,
+      accrued_minor INTEGER NOT NULL,
+      paid_minor INTEGER NOT NULL,
+      closing_minor INTEGER NOT NULL,
+      -- Справочные величины снимка. В сальдо не входят, но бухгалтер обязан
+      -- их видеть: несогласованное в акт попало, аванс — нет.
+      unapproved_minor INTEGER NOT NULL DEFAULT 0,
+      unapproved_count INTEGER NOT NULL DEFAULT 0,
+      unallocated_minor INTEGER NOT NULL DEFAULT 0,
+      excluded_minor INTEGER NOT NULL DEFAULT 0,
+      excluded_count INTEGER NOT NULL DEFAULT 0,
+      -- Оплаты по отклонённым документам: отсекаются по дате платежа, а не
+      -- документа, поэтому живут отдельной парой колонок.
+      excluded_paid_minor INTEGER NOT NULL DEFAULT 0,
+      excluded_paid_count INTEGER NOT NULL DEFAULT 0,
+      -- Сальдо со слов контрагента. NULL — ответа ещё нет.
+      their_closing_minor INTEGER,
+      note TEXT NOT NULL DEFAULT '',
+      responsible_user_id INTEGER REFERENCES users(id),
+      built_at TEXT NOT NULL,
+      created_by INTEGER REFERENCES users(id),
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      sent_at TEXT,
+      signed_at TEXT,
+      signed_by INTEGER REFERENCES users(id)
+    );
+
+    CREATE TABLE reconciliation_lines (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      reconciliation_id INTEGER NOT NULL REFERENCES reconciliations(id) ON DELETE CASCADE,
+      sort INTEGER NOT NULL,
+      kind TEXT NOT NULL CHECK(kind IN ('document','payment','their')),
+      -- Ссылки нужны для перехода в карточку; сумма и название всё равно
+      -- лежат снимком рядом, поэтому удаление первички акт не ломает.
+      document_id INTEGER REFERENCES documents(id) ON DELETE SET NULL,
+      payment_id INTEGER REFERENCES payments(id) ON DELETE SET NULL,
+      line_date TEXT NOT NULL,
+      title TEXT NOT NULL,
+      -- Расшифровка и НДС лежат снимком, а не подтягиваются JOIN-ом: иначе
+      -- подсказка «расхождение равно НДС» отваливается ровно тогда, когда
+      -- документ удалён, — то есть когда она нужнее всего.
+      purpose TEXT NOT NULL DEFAULT '',
+      vat_minor INTEGER NOT NULL DEFAULT 0,
+      accrued_minor INTEGER NOT NULL DEFAULT 0,
+      paid_minor INTEGER NOT NULL DEFAULT 0,
+      -- Что по этой строке у контрагента. NULL — не сверяли, 0 — у него её нет.
+      their_amount_minor INTEGER,
+      -- Исходная строка вставки — чтобы было видно, что именно разобрали.
+      their_raw TEXT NOT NULL DEFAULT '',
+      match TEXT NOT NULL DEFAULT 'unknown'
+        CHECK(match IN ('unknown','match','amount_diff','only_ours','only_theirs')),
+      -- Расхождение разобрано: акт нельзя подписать, пока есть неразобранные.
+      resolved INTEGER NOT NULL DEFAULT 0,
+      comment TEXT NOT NULL DEFAULT ''
+    );
+
     CREATE TABLE audit_log (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       entity_type TEXT NOT NULL,
@@ -362,6 +443,12 @@ function migrate(): boolean {
     CREATE INDEX idx_closing_tasks_period ON closing_tasks(period);
     CREATE INDEX idx_saved_views_user ON saved_views(user_id);
     CREATE INDEX idx_sessions_expires ON sessions(expires_at);
+    CREATE INDEX idx_reconciliations_counterparty ON reconciliations(counterparty_id);
+    CREATE INDEX idx_reconciliations_status ON reconciliations(status);
+    CREATE INDEX idx_reconciliation_lines_act ON reconciliation_lines(reconciliation_id);
+    -- Сверка режет платежи по дате, а индекса на payment_date в проекте не было:
+    -- без него каждый акт и каждый пересчёт дрейфа сканируют payments целиком.
+    CREATE INDEX idx_payments_date ON payments(payment_date);
   `);
 
   db.prepare(
@@ -671,6 +758,8 @@ function seed(): void {
   for (const p of periods) ensurePeriod(p.period);
   ensurePeriod(currentPeriod());
 
+  seedReconciliations({ cpAstana, cpTelecom, cpTrans, uAnna, uOlga, createdAt });
+
   logAudit({
     entityType: 'system',
     entityId: 0,
@@ -680,7 +769,105 @@ function seed(): void {
     details: { documents: docs.length, users: 5 },
   });
 
-  console.log(`База создана: ${docs.length} документов, 5 пользователей, 5 контрагентов.`);
+  console.log(
+    `База создана: ${docs.length} документов, 5 пользователей, 5 контрагентов, 3 акта сверки.`
+  );
+}
+
+/**
+ * Три демо-акта на готовых кейсах сида: сошедшийся, ждущий ответа и с
+ * расхождением. Снимок считается тем же модулем, что и боевой, — иначе
+ * демо разъедется с продуктом на первой же правке правил.
+ */
+function seedReconciliations(ids: {
+  cpAstana: number;
+  cpTelecom: number;
+  cpTrans: number;
+  uAnna: number;
+  uOlga: number;
+  createdAt: string;
+}): void {
+  const insertAct = db.prepare(
+    `INSERT INTO reconciliations
+       (number, counterparty_id, date_from, date_to, status,
+        opening_minor, accrued_minor, paid_minor, closing_minor,
+        unapproved_minor, unapproved_count, unallocated_minor,
+        excluded_minor, excluded_count, excluded_paid_minor, excluded_paid_count,
+        their_closing_minor, note, responsible_user_id, built_at,
+        created_by, created_at, updated_at, sent_at, signed_at, signed_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  );
+  const insertLine = db.prepare(
+    `INSERT INTO reconciliation_lines
+       (reconciliation_id, sort, kind, document_id, payment_id, line_date, title,
+        purpose, vat_minor, accrued_minor, paid_minor, their_amount_minor, match, comment)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  );
+
+  const make = (
+    number: string,
+    counterparty: number,
+    back: number,
+    monthsWide: number,
+    status: string,
+    opts: { theirClosing?: number | null; note?: string; signedBy?: number | null } = {}
+  ) => {
+    const end = monthRange(back);
+    const start = monthRange(back + monthsWide - 1);
+    const snap = statement(counterparty, start.from, end.to);
+    // Сошедшийся акт: сальдо контрагента равно нашему, если не сказано иначе.
+    const theirs = opts.theirClosing === undefined ? snap.closing : opts.theirClosing;
+
+    const actId = Number(
+      insertAct.run(
+        number, counterparty, start.from, end.to, status,
+        snap.opening, snap.accrued, snap.paid, snap.closing,
+        snap.unapproved, snap.unapprovedCount, snap.unallocated,
+        snap.excluded, snap.excludedCount, snap.excludedPaid, snap.excludedPaidCount,
+        theirs, opts.note ?? '', ids.uAnna, ids.createdAt,
+        ids.uAnna, ids.createdAt, ids.createdAt,
+        status === 'draft' ? null : ids.createdAt,
+        status === 'signed' ? ids.createdAt : null,
+        status === 'signed' ? (opts.signedBy ?? ids.uOlga) : null
+      ).lastInsertRowid
+    );
+
+    snap.lines.forEach((line, index) => {
+      const ours = line.accrued + line.paid;
+      // У сошедшегося акта контрагент подтвердил каждую строку; у спорного
+      // строки остаются несверенными, кроме той, из-за которой спор.
+      const confirmed = theirs === snap.closing;
+      insertLine.run(
+        actId, index, line.kind, line.documentId, line.paymentId,
+        line.date, line.title, line.purpose, line.vat, line.accrued, line.paid,
+        confirmed ? ours : null, confirmed ? 'match' : 'unknown', ''
+      );
+    });
+    return { actId, snap, sort: snap.lines.length };
+  };
+
+  make('АС-' + monthRange(2).period.slice(0, 4) + '-001', ids.cpAstana, 2, 1, 'signed');
+  // Отправлен и ждёт ответа: сальдо контрагента ещё не известно.
+  make('АС-' + monthRange(1).period.slice(0, 4) + '-002', ids.cpTelecom, 1, 1, 'sent', {
+    theirClosing: null,
+  });
+
+  // Спорный: контрагент не увидел нашу частичную предоплату по СЧ-2026-499
+  // и вдобавок прислал накладную, которой у нас нет.
+  const disputed = make('АС-' + monthRange(0).period.slice(0, 4) + '-003', ids.cpTrans, 0, 2, 'disputed', {
+    theirClosing: null,
+    note: 'Контрагент не разнёс предоплату и прислал накладную, которой у нас нет',
+  });
+  const theirClosing = disputed.snap.closing + 1_200_000 * T + 340_000 * T;
+  db.prepare('UPDATE reconciliations SET their_closing_minor = ? WHERE id = ?').run(
+    theirClosing,
+    disputed.actId
+  );
+  insertLine.run(
+    disputed.actId, disputed.sort, 'their', null, null,
+    monthRange(0).from, 'НК-7781 (накладная контрагента)',
+    'Из выписки контрагента', 0, 0, 0, 340_000 * T, 'only_theirs', ''
+  );
 }
 
 const created = migrate();

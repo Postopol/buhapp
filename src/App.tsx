@@ -11,6 +11,8 @@ import { CounterpartyDetail } from '@/pages/CounterpartyDetail';
 import { Payments } from '@/pages/Payments';
 import { Closing } from '@/pages/Closing';
 import { Taxes } from '@/pages/Taxes';
+import { Reconciliations } from '@/pages/Reconciliations';
+import { ReconciliationDetail } from '@/pages/ReconciliationDetail';
 
 function ProtectedRoute({ children }: { children: ReactNode }) {
   const { isAuthenticated, loading } = useAuth();
@@ -46,6 +48,8 @@ function AppRoutes() {
         <Route path="payments" element={<Payments />} />
         <Route path="closing" element={<Closing />} />
         <Route path="taxes" element={<Taxes />} />
+        <Route path="reconciliations" element={<Reconciliations />} />
+        <Route path="reconciliations/:id" element={<ReconciliationDetail />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>
     </Routes>

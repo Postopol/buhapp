@@ -4,10 +4,14 @@ import {
   ORIGINAL_LABELS,
   PAYMENT_LABELS,
   POSTING_LABELS,
+  RECONCILIATION_STATUS_LABELS,
+  LINE_MATCH_LABELS,
   type ApprovalStatus,
+  type LineMatch,
   type OriginalStatus,
   type PaymentState,
   type PostingStatus,
+  type ReconciliationStatus,
 } from '@shared/domain';
 
 type Tone = 'neutral' | 'info' | 'good' | 'warn' | 'bad';
@@ -103,6 +107,39 @@ export function PostingChip({ status }: { status: PostingStatus }) {
   return (
     <Chip tone={status === 'posted' ? 'good' : 'neutral'} title="Статус учёта">
       {POSTING_LABELS[status]}
+    </Chip>
+  );
+}
+
+const RECONCILIATION_TONE: Record<ReconciliationStatus, Tone> = {
+  draft: 'neutral',
+  sent: 'info',
+  signed: 'good',
+  disputed: 'bad',
+  cancelled: 'neutral',
+};
+
+export function ReconciliationChip({ status }: { status: ReconciliationStatus }) {
+  return (
+    <Chip tone={RECONCILIATION_TONE[status]} title="Статус акта сверки">
+      {RECONCILIATION_STATUS_LABELS[status]}
+    </Chip>
+  );
+}
+
+const MATCH_TONE: Record<LineMatch, Tone> = {
+  unknown: 'neutral',
+  match: 'good',
+  amount_diff: 'bad',
+  only_ours: 'warn',
+  only_theirs: 'warn',
+};
+
+export function MatchChip({ match, resolved }: { match: LineMatch; resolved?: boolean }) {
+  // Разобранное расхождение перестаёт быть красным: работа по нему закрыта.
+  return (
+    <Chip tone={resolved ? 'neutral' : MATCH_TONE[match]} title="Результат сверки строки">
+      {resolved ? `${LINE_MATCH_LABELS[match]} · разобрано` : LINE_MATCH_LABELS[match]}
     </Chip>
   );
 }

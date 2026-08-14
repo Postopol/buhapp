@@ -1,14 +1,28 @@
 import type {
   ApprovalStatus,
   DocType,
+  LineMatch,
   OriginalStatus,
   PaymentState,
   PostingStatus,
+  ReconciliationLineKind,
+  ReconciliationStatus,
   Role,
   Section,
 } from '@shared/domain';
 
-export type { ApprovalStatus, DocType, OriginalStatus, PaymentState, PostingStatus, Role, Section };
+export type {
+  ApprovalStatus,
+  DocType,
+  LineMatch,
+  OriginalStatus,
+  PaymentState,
+  PostingStatus,
+  ReconciliationLineKind,
+  ReconciliationStatus,
+  Role,
+  Section,
+};
 
 export interface User {
   id: number;
@@ -194,6 +208,151 @@ export interface CounterpartyDetail extends Counterparty {
   documentsCount: number;
   missingOriginals: number;
   contracts: CounterpartyContract[];
+}
+
+// ── Акты сверки ─────────────────────────────────────────────────────────────
+
+/** Строка акта. Суммы — в тиынах, как везде. */
+export interface ReconciliationLine {
+  id: number;
+  kind: ReconciliationLineKind;
+  documentId: number | null;
+  paymentId: number | null;
+  date: string;
+  title: string;
+  purpose: string;
+  comment: string;
+  accrued: number;
+  paid: number;
+  vat: number;
+  ourAmount: number;
+  theirAmount: number | null;
+  theirRaw: string;
+  delta: number | null;
+  match: LineMatch;
+  matchLabel: string;
+  resolved: boolean;
+  needsWork: boolean;
+  hint: string;
+}
+
+export interface Reconciliation {
+  id: number;
+  number: string;
+  counterpartyId: number;
+  counterpartyName: string;
+  counterpartyBin: string;
+  from: string;
+  to: string;
+  status: ReconciliationStatus;
+  statusLabel: string;
+  opening: number;
+  accrued: number;
+  paid: number;
+  closing: number;
+  unapproved: number;
+  unapprovedCount: number;
+  unallocated: number;
+  theirClosing: number | null;
+  diff: number | null;
+  note: string;
+  responsibleId: number | null;
+  responsibleName: string | null;
+  builtAt: string;
+  createdByName: string | null;
+  createdAt: string;
+  updatedAt: string;
+  sentAt: string | null;
+  signedAt: string | null;
+  signedByName: string | null;
+  periodClosed: boolean;
+  /** Все месяцы диапазона закрыты — цифры под актом больше не поедут. */
+  final: boolean;
+}
+
+export interface ReconciliationDrift {
+  closingNow: number;
+  delta: number;
+  changed: boolean;
+  checkedAt: string;
+}
+
+export interface ReconciliationWarnings {
+  unapproved: number;
+  unapprovedCount: number;
+  unallocated: number;
+  excluded: number;
+  excludedCount: number;
+  excludedPaid: number;
+  excludedPaidCount: number;
+  duplicates: { amount: number; numbers: string }[];
+  unresolved: number;
+}
+
+export interface ReconciliationTransitionOption {
+  label: string;
+  to: ReconciliationStatus;
+  roles: Role[];
+  requiresComment?: boolean;
+}
+
+/** Право на правку считает сервер: на клиенте оно бы разъехалось с ним. */
+export interface ReconciliationPermissions {
+  edit: boolean;
+  /** Почему нельзя — показывается на экране, а не угадывается. */
+  editDenied: string | null;
+  resolveThreshold: number;
+  isChief: boolean;
+}
+
+export interface ReconciliationDetail extends Reconciliation {
+  lines: ReconciliationLine[];
+  basis: string;
+  permissions: ReconciliationPermissions;
+  drift: ReconciliationDrift;
+  warnings: ReconciliationWarnings;
+  transitions: ReconciliationTransitionOption[];
+  history: HistoryEntry[];
+}
+
+/** Расчёт без сохранения — «сколько мы им должны» до формального акта. */
+export interface ReconciliationStatement {
+  counterpartyId: number;
+  from: string;
+  to: string;
+  opening: number;
+  accrued: number;
+  paid: number;
+  closing: number;
+  unapproved: number;
+  unapprovedCount: number;
+  unallocated: number;
+  excluded: number;
+  excludedCount: number;
+  excludedPaid: number;
+  excludedPaidCount: number;
+  duplicates: { amount: number; numbers: string }[];
+  lines: {
+    kind: 'document' | 'payment';
+    documentId: number | null;
+    paymentId: number | null;
+    date: string;
+    title: string;
+    purpose: string;
+    accrued: number;
+    paid: number;
+    vat: number;
+  }[];
+}
+
+export interface ReconciliationSummary {
+  period: string;
+  total: number;
+  draft: number;
+  sent: number;
+  signed: number;
+  disputed: number;
+  debtorsWithoutAct: number;
 }
 
 export interface Queue {

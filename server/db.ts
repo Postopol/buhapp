@@ -24,6 +24,17 @@ db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
 
 /**
+ * Встроенный LOWER в SQLite знает только латиницу: LOWER('СЧ-4471') возвращает
+ * строку без изменений, и поиск по кириллице не находит вообще ничего —
+ * а в этом приложении по-русски написано всё. Своя функция считает через JS,
+ * который умеет Unicode.
+ */
+db.function('rulower', { deterministic: true }, (value: unknown) =>
+  typeof value === 'string' ? value.toLowerCase() : null
+);
+
+
+/**
  * Версия схемы. При несовпадении база пересоздаётся целиком —
  * прежняя схема госоргана (requests / ifp_data / integrations) несовместима.
  */

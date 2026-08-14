@@ -65,7 +65,7 @@ counterpartiesRouter.get('/', (req, res) => {
   const params: unknown[] = [];
   let where = '';
   if (search && search.trim()) {
-    where = 'WHERE LOWER(c.name) LIKE ? OR c.bin LIKE ?';
+    where = 'WHERE rulower(c.name) LIKE ? OR c.bin LIKE ?';
     const term = `%${search.trim().toLowerCase()}%`;
     params.push(term, term);
   }

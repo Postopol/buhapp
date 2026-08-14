@@ -75,7 +75,7 @@ paymentsRouter.get('/', (req, res) => {
   const conditions: string[] = [];
   const params: unknown[] = [];
   if (search && search.trim()) {
-    conditions.push('(LOWER(p.reference) LIKE ? OR LOWER(p.note) LIKE ? OR p.bank_account LIKE ?)');
+    conditions.push('(rulower(p.reference) LIKE ? OR rulower(p.note) LIKE ? OR p.bank_account LIKE ?)');
     const term = `%${search.trim().toLowerCase()}%`;
     params.push(term, term, term);
   }

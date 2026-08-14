@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { db, nowTimestamp, today, logAudit, isPeriodClosed, ensurePeriod } from '../db';
 import { requireAuth } from '../auth';
 import type { AuthUser } from '../auth';
+import { csvMoney, csvRow, csvBody } from '../csv';
 import {
   TRANSITIONS,
   CHIEF_APPROVAL_THRESHOLD,
@@ -227,7 +228,7 @@ function buildFilters(q: ListQuery, user: AuthUser): { where: string; params: un
 
   if (q.search && q.search.trim()) {
     conditions.push(
-      `(LOWER(d.number) LIKE ? OR LOWER(d.purpose) LIKE ? OR LOWER(COALESCE(cp.name, '')) LIKE ? OR COALESCE(cp.bin, '') LIKE ?)`
+      `(rulower(d.number) LIKE ? OR rulower(d.purpose) LIKE ? OR rulower(COALESCE(cp.name, '')) LIKE ? OR COALESCE(cp.bin, '') LIKE ?)`
     );
     const term = `%${q.search.trim().toLowerCase()}%`;
     params.push(term, term, term, term);
@@ -289,30 +290,24 @@ documentsRouter.get('/export.csv', (req, res) => {
     .prepare(`${BASE_SELECT} WHERE ${where} ORDER BY d.doc_date DESC, d.id DESC LIMIT 10000`)
     .all(...params) as DocRow[];
 
-  const money = (minor: number) => (minor / 100).toFixed(2).replace('.', ',');
-  const cell = (value: unknown) => {
-    const s = value === null || value === undefined ? '' : String(value);
-    return /[";\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-  };
-
   const header = [
     'Дата', 'Тип', 'Номер', 'Контрагент', 'БИН', 'Сумма', 'в т.ч. НДС', 'Оплачено',
     'Статья', 'Срок оплаты', 'Согласование', 'Оригинал', 'Оплата', 'Учёт', 'Ответственный', 'Назначение',
   ];
   const paymentLabel: Record<PaymentState, string> = { unpaid: 'Не оплачен', partial: 'Частично', paid: 'Оплачен' };
 
-  const lines = [header.join(';')];
+  const lines = [csvRow(header)];
   for (const row of rows) {
     lines.push(
-      [
+      csvRow([
         row.doc_date,
         DOC_TYPE_SHORT[row.type],
         row.number,
         row.counterparty_name ?? '',
         row.counterparty_bin ?? '',
-        money(row.amount_minor),
-        money(row.vat_minor),
-        money(row.paid_minor),
+        csvMoney(row.amount_minor),
+        csvMoney(row.vat_minor),
+        csvMoney(row.paid_minor),
         row.expense_item_name ?? '',
         row.due_date ?? '',
         APPROVAL_LABELS[row.approval_status],
@@ -321,15 +316,13 @@ documentsRouter.get('/export.csv', (req, res) => {
         row.posting_status === 'posted' ? 'Проведён' : 'Не проведён',
         row.responsible_name ?? '',
         row.purpose,
-      ]
-        .map(cell)
-        .join(';')
+      ])
     );
   }
 
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
   res.setHeader('Content-Disposition', `attachment; filename="documents-${today()}.csv"`);
-  res.send('﻿' + lines.join('\r\n'));
+  res.send(csvBody(lines));
 });
 
 function loadDoc(id: number): DocRow | undefined {

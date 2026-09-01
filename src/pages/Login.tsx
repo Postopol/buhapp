@@ -1,5 +1,6 @@
+/// <reference types="vite/client" />
 import { useState, useEffect, type FormEvent } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useLocation, type Location } from 'react-router-dom';
 import { useAuth } from '@/context/AuthContext';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -15,17 +16,37 @@ const DEMO_ACCOUNTS = [
   { email: 'erlan@company.kz', role: 'Руководитель' },
 ];
 
+/**
+ * Список демо-доступов вместе с паролем — вещь для стенда, и на экране входа
+ * она переживёт любое внедрение, если не оставить выключателя. По умолчанию
+ * показываем только в dev-сборке; VITE_SHOW_DEMO_LOGINS=true включает блок на
+ * демо-стенде, а false гасит его и в разработке.
+ */
+const SHOW_DEMO_LOGINS = import.meta.env.VITE_SHOW_DEMO_LOGINS
+  ? import.meta.env.VITE_SHOW_DEMO_LOGINS === 'true'
+  : import.meta.env.DEV;
+
 export function Login() {
   const { login, isAuthenticated, loading: authLoading } = useAuth();
   const navigate = useNavigate();
+  const location = useLocation();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [submitting, setSubmitting] = useState(false);
 
+  // Адрес, с которого ProtectedRoute отправил сюда: возвращаем на него вместе
+  // с фильтрами в query, иначе пересланная ссылка на карточку умирает на
+  // рабочем месте, а протухшая сессия выбрасывает с текущего экрана.
+  const from = (location.state as { from?: Location } | null)?.from;
+  const target =
+    from && !from.pathname.startsWith('/login')
+      ? `${from.pathname}${from.search}${from.hash}`
+      : '/';
+
   useEffect(() => {
-    if (!authLoading && isAuthenticated) navigate('/', { replace: true });
-  }, [authLoading, isAuthenticated, navigate]);
+    if (!authLoading && isAuthenticated) navigate(target, { replace: true });
+  }, [authLoading, isAuthenticated, navigate, target]);
 
   const handleLogin = async (e: FormEvent) => {
     e.preventDefault();
@@ -33,7 +54,7 @@ export function Login() {
     setSubmitting(true);
     try {
       await login(email.trim(), password);
-      navigate('/', { replace: true });
+      navigate(target, { replace: true });
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'Не удалось подключиться к серверу');
     } finally {
@@ -92,23 +113,24 @@ export function Login() {
           </form>
         </CardContent>
 
-        {/* Демо-аккаунты: убрать перед продом */}
-        <CardFooter className="flex-col items-stretch space-y-2 border-t border-slate-100 pt-5">
-          <p className="text-xs font-semibold text-slate-500">Демо-доступы (пароль pass123):</p>
-          <div className="space-y-1">
-            {DEMO_ACCOUNTS.map((account) => (
-              <button
-                key={account.email}
-                type="button"
-                onClick={() => fillDemo(account.email)}
-                className="flex w-full items-baseline justify-between gap-2 rounded px-2 py-1 text-left text-xs hover:bg-slate-50"
-              >
-                <span className="font-mono text-slate-700">{account.email}</span>
-                <span className="text-slate-400">{account.role}</span>
-              </button>
-            ))}
-          </div>
-        </CardFooter>
+        {SHOW_DEMO_LOGINS && (
+          <CardFooter className="flex-col items-stretch space-y-2 border-t border-slate-100 pt-5">
+            <p className="text-xs font-semibold text-slate-500">Демо-доступы (пароль pass123):</p>
+            <div className="space-y-1">
+              {DEMO_ACCOUNTS.map((account) => (
+                <button
+                  key={account.email}
+                  type="button"
+                  onClick={() => fillDemo(account.email)}
+                  className="flex w-full items-baseline justify-between gap-2 rounded px-2 py-1 text-left text-xs hover:bg-slate-50"
+                >
+                  <span className="font-mono text-slate-700">{account.email}</span>
+                  <span className="text-slate-400">{account.role}</span>
+                </button>
+              ))}
+            </div>
+          </CardFooter>
+        )}
       </Card>
     </div>
   );

@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { db, nowTimestamp, today, logAudit, isPeriodClosed, ensurePeriod } from '../db';
-import { requireAuth } from '../auth';
+import { requireAuth, requireRole } from '../auth';
 import type { AuthUser } from '../auth';
 import { csvMoney, csvRow, csvBody } from '../csv';
 import {
@@ -13,6 +13,10 @@ import {
   APPROVAL_LABELS,
   ORIGINAL_LABELS,
   PAGE_SIZE,
+  DATE_RE,
+  PERIOD_RE,
+  vatFromGross,
+  vatRateOn,
   type ApprovalStatus,
   type DocType,
   type OriginalStatus,
@@ -33,12 +37,14 @@ const BASE_SELECT = `
     d.amount_minor, d.vat_minor, d.purpose, d.section,
     d.responsible_user_id, d.created_by,
     d.approval_status, d.original_status, d.posting_status,
+    d.closes_document_id,
     d.created_at, d.updated_at,
     cp.name AS counterparty_name, cp.bin AS counterparty_bin,
     ei.name AS expense_item_name, ei.code AS expense_item_code,
     ru.name AS responsible_name,
     cu.name AS created_by_name,
     ct.number AS contract_number,
+    cd.number AS closes_document_number,
     COALESCE(pay.paid, 0) AS paid_minor,
     (SELECT COUNT(*) FROM attachments a WHERE a.document_id = d.id) AS attachments_count,
     (SELECT COUNT(*) FROM comments c WHERE c.document_id = d.id) AS comments_count
@@ -48,6 +54,7 @@ const BASE_SELECT = `
   LEFT JOIN users ru ON ru.id = d.responsible_user_id
   LEFT JOIN users cu ON cu.id = d.created_by
   LEFT JOIN contracts ct ON ct.id = d.contract_id
+  LEFT JOIN documents cd ON cd.id = d.closes_document_id
   LEFT JOIN (
     SELECT document_id, SUM(amount_minor) AS paid FROM document_payments GROUP BY document_id
   ) pay ON pay.document_id = d.id
@@ -72,6 +79,7 @@ interface DocRow {
   approval_status: ApprovalStatus;
   original_status: OriginalStatus;
   posting_status: 'not_posted' | 'posted';
+  closes_document_id: number | null;
   created_at: string;
   updated_at: string;
   counterparty_name: string | null;
@@ -81,6 +89,7 @@ interface DocRow {
   responsible_name: string | null;
   created_by_name: string | null;
   contract_number: string | null;
+  closes_document_number: string | null;
   paid_minor: number;
   attachments_count: number;
   comments_count: number;
@@ -100,7 +109,17 @@ function isOverdue(row: DocRow): boolean {
   return row.due_date < today();
 }
 
-function mapDoc(row: DocRow) {
+/**
+ * Закрытые периоды одним запросом на весь ответ. Их в базе единицы, а mapDoc
+ * до этого ходил в periods за КАЖДОЙ строкой реестра — до 200 лишних запросов
+ * на страницу и до 10 000 на выгрузку CSV.
+ */
+function closedPeriods(): Set<string> {
+  const rows = db.prepare(`SELECT period FROM periods WHERE status = 'closed'`).all() as { period: string }[];
+  return new Set(rows.map((r) => r.period));
+}
+
+function mapDoc(row: DocRow, closed?: Set<string>) {
   return {
     id: row.id,
     type: row.type,
@@ -129,12 +148,16 @@ function mapDoc(row: DocRow) {
     approvalStatus: row.approval_status,
     originalStatus: row.original_status,
     postingStatus: row.posting_status,
+    closesDocumentId: row.closes_document_id,
+    closesDocumentNumber: row.closes_document_number,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     attachmentsCount: row.attachments_count,
     commentsCount: row.comments_count,
     overdue: isOverdue(row),
-    periodClosed: isPeriodClosed(row.period),
+    // Для списка множество закрытых периодов приходит готовым, для одиночной
+    // карточки дешевле спросить базу напрямую.
+    periodClosed: closed ? closed.has(row.period) : isPeriodClosed(row.period),
   };
 }
 
@@ -148,6 +171,8 @@ function visibilityScope(user: AuthUser): { sql: string; params: unknown[] } {
   }
   return { sql: '1 = 1', params: [] };
 }
+
+const APPROVAL_STATUSES = Object.keys(APPROVAL_LABELS) as ApprovalStatus[];
 
 const SORTABLE: Record<string, string> = {
   docDate: 'd.doc_date',
@@ -177,6 +202,17 @@ export interface ListQuery {
   offset?: string;
 }
 
+/**
+ * Терм для LIKE. Проценты и подчёркивания в запросе — обычные символы номера,
+ * а не подстановка: без экранирования «100%» превращался в `%100%%` и совпадал
+ * со всем реестром, а «СЧ_44» находил ещё и «СЧ-44». Обратный слэш экранируем
+ * первым — иначе он съел бы собственную добавку.
+ */
+function likeTerm(raw: string): string {
+  const escaped = raw.trim().toLowerCase().replace(/[\\%_]/g, (ch) => `\\${ch}`);
+  return `%${escaped}%`;
+}
+
 function buildFilters(q: ListQuery, user: AuthUser): { where: string; params: unknown[] } {
   const scope = visibilityScope(user);
   const conditions: string[] = [scope.sql];
@@ -191,10 +227,33 @@ function buildFilters(q: ListQuery, user: AuthUser): { where: string; params: un
 
   eq(q.type, 'd.type', DOC_TYPES);
   eq(q.section, 'd.section', SECTIONS);
-  eq(q.approval, 'd.approval_status', Object.keys(APPROVAL_LABELS));
   eq(q.original, 'd.original_status', ORIGINAL_STATUSES);
   eq(q.posting, 'd.posting_status', ['not_posted', 'posted']);
-  eq(q.period, 'd.period');
+  // Период — строго YYYY-MM: мусорная строка иначе уходит в SQL и молча
+  // возвращает пустой реестр, будто документов за месяц нет.
+  if (q.period && q.period !== 'all' && PERIOD_RE.test(q.period)) {
+    conditions.push('d.period = ?');
+    params.push(q.period);
+  }
+
+  // Согласование принимает список через запятую: экрану закрытия месяца нужна
+  // одна ссылка на «черновики + на проверке + возвращённые» — блокировка
+  // считает эти три статуса вместе, и реестр обязан показывать ровно их.
+  // Одиночное значение — частный случай списка, старые ссылки не ломаются.
+  // String() — на случай повторённого параметра (?approval=draft&approval=review):
+  // Express отдаёт массив, и он превращается в тот же список через запятую.
+  const approvals = [
+    ...new Set(
+      String(q.approval ?? '')
+        .split(',')
+        .map((s) => s.trim())
+        .filter((s): s is ApprovalStatus => APPROVAL_STATUSES.includes(s as ApprovalStatus))
+    ),
+  ];
+  if (approvals.length > 0) {
+    conditions.push(`d.approval_status IN (${approvals.map(() => '?').join(', ')})`);
+    params.push(...approvals);
+  }
 
   if (q.counterparty && q.counterparty !== 'all') {
     conditions.push('d.counterparty_id = ?');
@@ -228,9 +287,12 @@ function buildFilters(q: ListQuery, user: AuthUser): { where: string; params: un
 
   if (q.search && q.search.trim()) {
     conditions.push(
-      `(rulower(d.number) LIKE ? OR rulower(d.purpose) LIKE ? OR rulower(COALESCE(cp.name, '')) LIKE ? OR COALESCE(cp.bin, '') LIKE ?)`
+      `(rulower(d.number) LIKE ? ESCAPE '\\'
+        OR rulower(d.purpose) LIKE ? ESCAPE '\\'
+        OR rulower(COALESCE(cp.name, '')) LIKE ? ESCAPE '\\'
+        OR COALESCE(cp.bin, '') LIKE ? ESCAPE '\\')`
     );
-    const term = `%${q.search.trim().toLowerCase()}%`;
+    const term = likeTerm(q.search);
     params.push(term, term, term, term);
   }
 
@@ -268,8 +330,9 @@ documentsRouter.get('/', (req, res) => {
     )
     .get(...params) as { count: number; amount: number; vat: number; paid: number };
 
+  const closed = closedPeriods();
   res.json({
-    documents: rows.map(mapDoc),
+    documents: rows.map((row) => mapDoc(row, closed)),
     total: totals.count,
     totals: {
       amount: totals.amount,
@@ -323,6 +386,73 @@ documentsRouter.get('/export.csv', (req, res) => {
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
   res.setHeader('Content-Disposition', `attachment; filename="documents-${today()}.csv"`);
   res.send(csvBody(lines));
+});
+
+/**
+ * Счета контрагента, которые ещё можно закрыть актом или накладной.
+ * Отдельный маршрут, а не фильтр реестра: форма документа выбирает счёт по
+ * контрагенту, и ей нужны не все поля реестра, а остаток к оплате и уже
+ * занятость счёта другим закрывающим документом. `exclude` — сам
+ * редактируемый документ, иначе при правке акта его собственный счёт
+ * пропадал бы из списка как «уже занятый».
+ */
+documentsRouter.get('/closable', (req, res) => {
+  const counterpartyId = Number(req.query.counterparty);
+  if (!Number.isInteger(counterpartyId) || counterpartyId <= 0) {
+    res.status(400).json({ error: 'Укажите контрагента' });
+    return;
+  }
+  const excludeId = Number(req.query.exclude) || 0;
+  const scope = visibilityScope(req.user!);
+
+  const rows = db
+    .prepare(
+      `SELECT d.id, d.number, d.doc_date, d.due_date, d.amount_minor, d.purpose,
+              d.contract_id, d.expense_item_id, d.section,
+              COALESCE(pay.paid, 0) AS paid_minor
+       FROM documents d
+       LEFT JOIN (
+         SELECT document_id, SUM(amount_minor) AS paid FROM document_payments GROUP BY document_id
+       ) pay ON pay.document_id = d.id
+       WHERE d.type = 'invoice'
+         AND d.counterparty_id = ?
+         AND d.approval_status <> 'rejected'
+         AND d.id <> ?
+         AND NOT EXISTS (
+           SELECT 1 FROM documents c
+           WHERE c.closes_document_id = d.id AND c.approval_status <> 'rejected' AND c.id <> ?
+         )
+         AND ${scope.sql}
+       ORDER BY d.doc_date DESC, d.id DESC
+       LIMIT 100`
+    )
+    .all(counterpartyId, excludeId, excludeId, ...scope.params) as {
+    id: number;
+    number: string;
+    doc_date: string;
+    due_date: string | null;
+    amount_minor: number;
+    purpose: string;
+    contract_id: number | null;
+    expense_item_id: number | null;
+    section: Section;
+    paid_minor: number;
+  }[];
+
+  res.json({
+    documents: rows.map((r) => ({
+      id: r.id,
+      number: r.number,
+      docDate: r.doc_date,
+      dueDate: r.due_date,
+      amount: r.amount_minor,
+      paid: r.paid_minor,
+      purpose: r.purpose,
+      contractId: r.contract_id,
+      expenseItemId: r.expense_item_id,
+      section: r.section,
+    })),
+  });
 });
 
 function loadDoc(id: number): DocRow | undefined {
@@ -426,9 +556,20 @@ interface DocBody {
   purpose?: string;
   section?: Section;
   responsibleId?: number | null;
+  closesDocumentId?: number | null;
 }
 
-const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+/**
+ * Потолок суммы документа — 1 000 000 000 ₸. Ограничение не бухгалтерское,
+ * а защитное: без него опечатка в лишний ноль проходила молча и всплывала
+ * уже в сальдо контрагента и в итогах реестра, а суммы по выборке рано или
+ * поздно выходили за пределы точного целого в JS.
+ * ВНИМАНИЕ: в тиынах, как и все суммы в системе.
+ */
+const MAX_AMOUNT_MINOR = 1_000_000_000 * 100;
+
+/** Типы, которые закрывают счёт: акт выполненных работ и накладная. */
+const CLOSING_TYPES: DocType[] = ['act', 'waybill'];
 
 function validate(body: DocBody, partial: boolean): string | null {
   const need = (key: keyof DocBody) => !partial || body[key] !== undefined;
@@ -445,12 +586,25 @@ function validate(body: DocBody, partial: boolean): string | null {
   if (need('amount')) {
     const amount = Number(body.amount);
     if (!Number.isInteger(amount) || amount <= 0) return 'Сумма должна быть положительным числом';
+    if (amount > MAX_AMOUNT_MINOR) {
+      return `Сумма больше ${(MAX_AMOUNT_MINOR / 100).toLocaleString('ru-KZ')} ₸ — проверьте, не лишний ли ноль`;
+    }
   }
   if (body.vat !== undefined && body.vat !== null) {
     const vat = Number(body.vat);
     if (!Number.isInteger(vat) || vat < 0) return 'Некорректная сумма НДС';
     const amount = Number(body.amount);
-    if (Number.isInteger(amount) && vat > amount) return 'НДС не может превышать сумму документа';
+    // Сумма документа в первичке РК уже с НДС, поэтому потолок налога — не сама
+    // сумма, а то, что вообще выделяется из неё по ставке НА ДАТУ документа:
+    // с 2026 года 16 %, у документов прошлых лет навсегда 12 %. Допуск в тенге —
+    // на построчное округление в счёте поставщика.
+    if (Number.isInteger(amount) && body.docDate && DATE_RE.test(body.docDate)) {
+      const ceiling = vatFromGross(amount, body.docDate) + 100;
+      if (vat > ceiling) {
+        const percent = Math.round(vatRateOn(body.docDate) * 100);
+        return `НДС больше, чем ${percent} % от суммы с налогом на дату документа`;
+      }
+    }
   }
   if (body.counterpartyId) {
     const exists = db.prepare('SELECT 1 FROM counterparties WHERE id = ?').get(body.counterpartyId);
@@ -460,15 +614,85 @@ function validate(body: DocBody, partial: boolean): string | null {
     const exists = db.prepare('SELECT 1 FROM expense_items WHERE id = ?').get(body.expenseItemId);
     if (!exists) return 'Статья расходов не найдена';
   }
+  // Раньше несуществующий id доезжал до INSERT и при foreign_keys=ON падал
+  // SqliteError'ом — пользователь получал 500 вместо внятного «не найден».
+  if (body.responsibleId) {
+    const exists = db.prepare('SELECT 1 FROM users WHERE id = ?').get(body.responsibleId);
+    if (!exists) return 'Ответственный не найден';
+  }
+  if (body.contractId) {
+    const contract = db.prepare('SELECT counterparty_id FROM contracts WHERE id = ?').get(body.contractId) as
+      | { counterparty_id: number }
+      | undefined;
+    if (!contract) return 'Договор не найден';
+    // Договор чужого контрагента — типичная ошибка выбора из общего списка,
+    // и она тихо ломает карточку контрагента и акт сверки.
+    if (!body.counterpartyId) return 'Сначала выберите контрагента — договор привязан к нему';
+    if (contract.counterparty_id !== Number(body.counterpartyId)) {
+      return 'Договор заключён с другим контрагентом';
+    }
+  }
   return null;
 }
 
-documentsRouter.post('/', (req, res) => {
+/**
+ * Проверка ссылки «этот документ закрывает вот этот счёт». Счёт на оплату сам
+ * по себе обязательства не создаёт — начисление создаёт закрывающий документ,
+ * поэтому связка режет счёт из начислений и обязана быть однозначной:
+ * один счёт — один не отклонённый закрывающий документ.
+ */
+function validateCloses(
+  closesId: number,
+  type: DocType | undefined,
+  counterpartyId: number | null,
+  selfId: number | null
+): string | null {
+  if (!type || !CLOSING_TYPES.includes(type)) return 'Закрывать счёт может только акт или накладная';
+  if (selfId !== null && closesId === selfId) return 'Документ не может закрывать сам себя';
+  if (counterpartyId === null) return 'Сначала выберите контрагента — счёт закрывается в его разрезе';
+
+  const target = db
+    .prepare('SELECT type, counterparty_id FROM documents WHERE id = ?')
+    .get(closesId) as { type: DocType; counterparty_id: number | null } | undefined;
+  if (!target) return 'Счёт не найден';
+  if (target.type !== 'invoice') return 'Закрыть можно только счёт на оплату';
+  if (target.counterparty_id !== Number(counterpartyId)) return 'Счёт выставлен другим контрагентом';
+
+  const busy = db
+    .prepare(
+      `SELECT number FROM documents
+       WHERE closes_document_id = ? AND approval_status <> 'rejected' AND id <> ?`
+    )
+    .get(closesId, selfId ?? 0) as { number: string } | undefined;
+  if (busy) return `Счёт уже закрыт документом ${busy.number}`;
+  return null;
+}
+
+/**
+ * Первичку заводит и правит тот, кто с ней работает: инициатор, бухгалтер,
+ * главбух. Руководителя в матрице ролей README в этих строках нет — он смотрит
+ * и принимает решения, но документов не создаёт и чужих не переписывает.
+ */
+const DOC_WRITERS = requireRole('initiator', 'accountant', 'chief_accountant');
+
+documentsRouter.post('/', DOC_WRITERS, (req, res) => {
   const body = req.body as DocBody;
   const error = validate(body, false);
   if (error) {
     res.status(400).json({ error });
     return;
+  }
+  if (body.closesDocumentId) {
+    const closesError = validateCloses(
+      Number(body.closesDocumentId),
+      body.type,
+      body.counterpartyId ?? null,
+      null
+    );
+    if (closesError) {
+      res.status(400).json({ error: closesError });
+      return;
+    }
   }
   const period = body.docDate!.slice(0, 7);
   if (isPeriodClosed(period)) {
@@ -495,8 +719,8 @@ documentsRouter.post('/', (req, res) => {
       `INSERT INTO documents
         (type, number, doc_date, due_date, period, counterparty_id, contract_id, expense_item_id,
          amount_minor, vat_minor, purpose, section, responsible_user_id, created_by,
-         approval_status, original_status, posting_status, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', 'none', 'not_posted', ?, ?)`
+         approval_status, original_status, posting_status, closes_document_id, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', 'none', 'not_posted', ?, ?, ?)`
     )
     .run(
       body.type,
@@ -513,6 +737,7 @@ documentsRouter.post('/', (req, res) => {
       body.section,
       responsibleId,
       user.id,
+      body.closesDocumentId ? Number(body.closesDocumentId) : null,
       ts,
       ts
     );
@@ -530,7 +755,7 @@ documentsRouter.post('/', (req, res) => {
   res.status(201).json({ document: mapDoc(loadDoc(id)!) });
 });
 
-documentsRouter.patch('/:id(\\d+)', (req, res) => {
+documentsRouter.patch('/:id(\\d+)', DOC_WRITERS, (req, res) => {
   const id = Number(req.params.id);
   const row = loadDoc(id);
   if (!row || !canSee(row, req.user!)) {
@@ -553,12 +778,50 @@ documentsRouter.patch('/:id(\\d+)', (req, res) => {
     res.status(403).json({ error: 'Документ на проверке, изменения недоступны' });
     return;
   }
+  // Отклонение — конец маршрута: под ним стоит причина главбуха, и правка
+  // содержимого сделала бы её отзывом на другой документ. Нужен новый.
+  if (row.approval_status === 'rejected') {
+    res.status(403).json({ error: 'Документ отклонён — изменить его нельзя, заведите новый' });
+    return;
+  }
 
   const body = req.body as DocBody;
-  const error = validate({ ...body, amount: body.amount ?? row.amount_minor, docDate: body.docDate ?? row.doc_date }, true);
+  // Контрагент подмешивается из документа: без него проверка «договор того же
+  // контрагента» на частичной правке не с чем сравнивать.
+  const counterpartyId = body.counterpartyId !== undefined ? body.counterpartyId : row.counterparty_id;
+  const error = validate(
+    {
+      ...body,
+      amount: body.amount ?? row.amount_minor,
+      docDate: body.docDate ?? row.doc_date,
+      counterpartyId,
+    },
+    true
+  );
   if (error) {
     res.status(400).json({ error });
     return;
+  }
+
+  // Оплата уже разнесена — уменьшать сумму ниже неё нельзя: инвариант
+  // «оплачено ≤ сумма», который держит POST /api/payments, иначе ломается
+  // задним числом, документ становится «оплачен» с переплатой, а сальдо
+  // контрагента и акты сверки — врут.
+  if (body.amount !== undefined && Number(body.amount) < row.paid_minor) {
+    const paid = (row.paid_minor / 100).toLocaleString('ru-KZ');
+    res.status(409).json({
+      error: `По документу уже разнесено ${paid} ₸ — сумма не может быть меньше. Снимите разнесение платежа.`,
+    });
+    return;
+  }
+
+  const closingType = body.type ?? row.type;
+  if (body.closesDocumentId) {
+    const closesError = validateCloses(Number(body.closesDocumentId), closingType, counterpartyId, row.id);
+    if (closesError) {
+      res.status(400).json({ error: closesError });
+      return;
+    }
   }
 
   const fields: Record<string, unknown> = {};
@@ -577,6 +840,15 @@ documentsRouter.patch('/:id(\\d+)', (req, res) => {
   assign('purpose', body.purpose?.trim());
   assign('section', body.section);
   assign('responsible_user_id', body.responsibleId);
+  assign(
+    'closes_document_id',
+    body.closesDocumentId === undefined ? undefined : body.closesDocumentId ? Number(body.closesDocumentId) : null
+  );
+  // Смена типа на незакрывающий обнуляет ссылку: счёт, «закрытый» договором
+  // или авансовым отчётом, молча выпал бы из начислений навсегда.
+  if (body.type && !CLOSING_TYPES.includes(body.type) && row.closes_document_id !== null) {
+    fields.closes_document_id = null;
+  }
   if (body.docDate) {
     const newPeriod = body.docDate.slice(0, 7);
     // Перенос датой в уже закрытый месяц — тот же обход блокировки.
@@ -639,10 +911,29 @@ function checkTransition(row: DocRow, to: ApprovalStatus, comment: string, user:
   return null;
 }
 
-function applyTransition(row: DocRow, to: ApprovalStatus, comment: string, user: AuthUser): void {
+/** Статус увели из-под перехода между проверкой прав и записью. */
+const STALE_TRANSITION = 'Статус документа изменился — обновите страницу и повторите';
+
+class StaleTransition extends Error {}
+
+/**
+ * Возвращает текст ошибки, если переход не применился, иначе null —
+ * тот же контракт, что у checkTransition.
+ *
+ * UPDATE идёт с условием на исходный статус: между loadDoc и записью документ
+ * мог уйти вперёд по маршруту (массовое действие соседа, вторая вкладка), и
+ * тогда переход применять нельзя. Сейчас однопроцессный better-sqlite3 это
+ * почти всегда спасает, но «почти» — не инвариант. Проверка changes === 1
+ * откатывает и комментарий: причина возврата без самого возврата хуже, чем
+ * ничего.
+ */
+function applyTransition(row: DocRow, to: ApprovalStatus, comment: string, user: AuthUser): string | null {
   const ts = nowTimestamp();
   const tx = db.transaction(() => {
-    db.prepare('UPDATE documents SET approval_status = ?, updated_at = ? WHERE id = ?').run(to, ts, row.id);
+    const info = db
+      .prepare('UPDATE documents SET approval_status = ?, updated_at = ? WHERE id = ? AND approval_status = ?')
+      .run(to, ts, row.id, row.approval_status);
+    if (info.changes !== 1) throw new StaleTransition();
     if (comment.trim()) {
       const kind = to === 'returned' || to === 'rejected' ? 'return_reason' : 'comment';
       db.prepare(
@@ -650,7 +941,12 @@ function applyTransition(row: DocRow, to: ApprovalStatus, comment: string, user:
       ).run(row.id, user.id, user.name, comment.trim(), kind, ts);
     }
   });
-  tx();
+  try {
+    tx();
+  } catch (err) {
+    if (err instanceof StaleTransition) return STALE_TRANSITION;
+    throw err;
+  }
   logAudit({
     entityType: 'document',
     entityId: row.id,
@@ -659,6 +955,7 @@ function applyTransition(row: DocRow, to: ApprovalStatus, comment: string, user:
     userName: user.name,
     details: { from: row.approval_status, to, comment: comment.trim() || undefined },
   });
+  return null;
 }
 
 documentsRouter.post('/:id(\\d+)/transition', (req, res) => {
@@ -677,7 +974,11 @@ documentsRouter.post('/:id(\\d+)/transition', (req, res) => {
     res.status(403).json({ error });
     return;
   }
-  applyTransition(row, to, comment ?? '', req.user!);
+  const stale = applyTransition(row, to, comment ?? '', req.user!);
+  if (stale) {
+    res.status(409).json({ error: stale });
+    return;
+  }
   res.json({ document: mapDoc(loadDoc(row.id)!) });
 });
 
@@ -712,7 +1013,11 @@ documentsRouter.post('/bulk/transition', (req, res) => {
       skipped.push({ id: row.id, number: row.number, reason: error });
       continue;
     }
-    applyTransition(row, to, comment ?? '', user);
+    const stale = applyTransition(row, to, comment ?? '', user);
+    if (stale) {
+      skipped.push({ id: row.id, number: row.number, reason: stale });
+      continue;
+    }
     applied.push(row.id);
   }
 
@@ -732,7 +1037,9 @@ documentsRouter.post('/:id(\\d+)/original', (req, res) => {
     res.status(409).json({ error: PERIOD_LOCKED });
     return;
   }
-  if (user.role === 'initiator') {
+  // «Ведёт оригинал и учёт» в матрице ролей — только бухгалтер и главбух:
+  // руководителю здесь делать нечего ровно так же, как инициатору.
+  if (user.role === 'initiator' || user.role === 'director') {
     res.status(403).json({ error: 'Статус оригинала ведёт бухгалтерия' });
     return;
   }

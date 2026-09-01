@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import type { Request, Response } from 'express';
-import { db, nowTimestamp, today, logAudit, isPeriodClosed } from '../db';
+import { db, nowTimestamp, today, logAudit } from '../db';
 import { requireAuth, requireRole } from '../auth';
 import type { AuthUser } from '../auth';
 import { statement, BASIS_TEXT, type Statement } from '../reconciliation';
@@ -13,6 +13,10 @@ import {
   RECON_ACCEPT_THRESHOLD,
   MAX_IMPORT_LINES,
   OUR_COMPANY,
+  DATE_RE,
+  PERIOD_RE,
+  vatFromGross,
+  vatRateOn,
   type LineMatch,
   type ReconciliationLineKind,
   type ReconciliationStatus,
@@ -29,8 +33,18 @@ reconciliationsRouter.use(requireAuth);
  */
 reconciliationsRouter.use(requireRole('accountant', 'chief_accountant', 'director'));
 
-const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
-const PERIOD_RE = /^\d{4}-\d{2}$/;
+/**
+ * Закрытые месяцы одним запросом. Реестр отдаёт до 300 актов, и на каждый
+ * уходило по обращению в базу за флагом «период закрыт» плюс ещё по одному
+ * на каждый месяц диапазона внутри isRangeFinal — сотни запросов на одну
+ * страницу. Список закрытых периодов маленький и читается целиком.
+ */
+function closedPeriods(): Set<string> {
+  const rows = db.prepare(`SELECT period FROM periods WHERE status = 'closed'`).all() as {
+    period: string;
+  }[];
+  return new Set(rows.map((r) => r.period));
+}
 
 /**
  * Закрытый месяц сверку НЕ ограничивает — и это осознанно, вопреки сквозному
@@ -45,14 +59,14 @@ const PERIOD_RE = /^\d{4}-\d{2}$/;
  * Вместо запрета акт отдаёт `final` — закрыты ли все месяцы диапазона.
  * Если нет, цифры под актом ещё могут поехать, и это написано на экране.
  */
-function isRangeFinal(from: string, to: string): boolean {
+function isRangeFinal(from: string, to: string, closed: Set<string>): boolean {
   const months: string[] = [];
   const [fy, fm] = from.slice(0, 7).split('-').map(Number);
   const [ty, tm] = to.slice(0, 7).split('-').map(Number);
   for (let y = fy, m = fm; y < ty || (y === ty && m <= tm); m === 12 ? ((y += 1), (m = 1)) : (m += 1)) {
     months.push(`${y}-${String(m).padStart(2, '0')}`);
   }
-  return months.every(isPeriodClosed);
+  return months.every((month) => closed.has(month));
 }
 
 function writeAllowed(res: Response, user: AuthUser): boolean {
@@ -163,8 +177,19 @@ export function verdictFor(
 
 /**
  * Подсказка «почему разошлось». Самый частый случай в РК — контрагент
- * показал сумму без НДС: налог уже сидит внутри amount_minor (12/112).
+ * показал сумму без НДС: налог уже сидит внутри amount_minor.
+ *
+ * Сравниваем с двумя цифрами. Первая — НДС, записанный в строку снимка.
+ * Вторая — НДС, посчитанный от нашей суммы по ставке НА ДАТУ документа
+ * (`vatFromGross`): ставка с 2026 года 16 %, а не 12 %, и у части документов
+ * `vat_minor` нулевой — заводили без разбивки. По одной сохранённой цифре
+ * подсказка для таких строк не сработала бы никогда.
+ *
+ * Допуск в один тиын — на округление в учёте контрагента: точное сравнение
+ * гасило самую полезную подсказку из-за расхождения в одну единицу.
  */
+const VAT_HINT_TOLERANCE = 1;
+
 function hintFor(row: LineRow): string {
   if (row.match === 'only_ours') {
     return row.kind === 'payment'
@@ -174,8 +199,17 @@ function hintFor(row: LineRow): string {
   if (row.match === 'only_theirs') return 'Документа у нас нет — запросите оригинал и заведите его';
   if (row.match !== 'amount_diff' || row.their_amount_minor === null) return '';
   const delta = ourAmount(row) - row.their_amount_minor;
-  if (row.vat_minor && delta === row.vat_minor) {
+  if (row.vat_minor > 0 && Math.abs(delta - row.vat_minor) <= VAT_HINT_TOLERANCE) {
     return 'Расхождение в точности равно НДС — контрагент показал сумму без налога';
+  }
+  // Расчётный НДС — только для начислений: внутри оплаты налога нет,
+  // и совпадение там было бы случайным.
+  if (row.kind === 'document') {
+    const byRate = vatFromGross(ourAmount(row), row.line_date);
+    if (byRate > 0 && Math.abs(delta - byRate) <= VAT_HINT_TOLERANCE) {
+      const rate = Math.round(vatRateOn(row.line_date) * 100);
+      return `Расхождение равно НДС по ставке ${rate} % на дату документа — похоже, контрагент показал сумму без налога`;
+    }
   }
   if (delta > 0) return 'У контрагента сумма меньше нашей';
   return 'У контрагента сумма больше нашей';
@@ -220,7 +254,13 @@ function linesOf(actId: number): LineRow[] {
     .all(actId) as LineRow[];
 }
 
-function mapAct(row: ActRow) {
+/**
+ * `closed` передаётся списком, а не спрашивается по одному периоду: в реестре
+ * mapAct вызывается на каждую строку, и запрос за флагом внутри превращался
+ * в N+1. Для одиночного акта список читается тут же — это один запрос вместо
+ * прежних двух и более.
+ */
+function mapAct(row: ActRow, closed: Set<string> = closedPeriods()) {
   const diff = row.their_closing_minor === null ? null : row.closing_minor - row.their_closing_minor;
   return {
     id: row.id,
@@ -251,9 +291,9 @@ function mapAct(row: ActRow) {
     sentAt: row.sent_at,
     signedAt: row.signed_at,
     signedByName: row.signed_by_name,
-    periodClosed: isPeriodClosed(row.date_to.slice(0, 7)),
+    periodClosed: closed.has(row.date_to.slice(0, 7)),
     /** Все месяцы диапазона закрыты — цифры под актом больше не поедут. */
-    final: isRangeFinal(row.date_from, row.date_to),
+    final: isRangeFinal(row.date_from, row.date_to, closed),
   };
 }
 
@@ -262,12 +302,21 @@ function loadAct(id: number): ActRow | undefined {
 }
 
 /**
- * Акт ведёт ответственный за контрагента, автор акта или главбух. Чужой
- * участок трогать нельзя — иначе двое бухгалтеров молча правят один акт.
+ * Акт ведёт ответственный за контрагента или главбух. Чужой участок трогать
+ * нельзя — иначе двое бухгалтеров молча правят один акт.
+ *
+ * Автора акта в этом списке нет намеренно. Сформировать акт может любой
+ * бухгалтер (расчёт ничего не меняет, а собрать сверку за коллегу — обычное
+ * дело), но право вести его этим не выдаётся: ответственный подставляется
+ * из карточки контрагента, и именно он остаётся хозяином акта. Раньше
+ * `created_by` обходил всё правило участка — достаточно было сформировать
+ * акт по чужому контрагенту первым.
+ *
+ * У контрагента без ответственного им становится автор (см. POST /), так что
+ * свои акты автор ведёт и без отдельной поблажки.
  */
 function mayEdit(row: ActRow, user: AuthUser): string | null {
   if (user.role === 'chief_accountant') return null;
-  if (row.created_by === user.id) return null;
   if (row.responsible_user_id === user.id) return null;
   return `Контрагент закреплён за ${row.responsible_name ?? 'другим бухгалтером'} — акт ведёт он или главный бухгалтер`;
 }
@@ -454,6 +503,8 @@ reconciliationsRouter.get('/', (req, res) => {
   const rows = db
     .prepare(`${ACT_SELECT} WHERE ${where} ORDER BY r.date_to DESC, r.id DESC LIMIT 300`)
     .all(...params) as ActRow[];
+  // Один список закрытых месяцев на всю страницу реестра.
+  const closed = closedPeriods();
 
   const totals = db
     .prepare(
@@ -464,7 +515,12 @@ reconciliationsRouter.get('/', (req, res) => {
     )
     .get(...params) as { count: number; disputed: number; signed: number };
 
-  res.json({ acts: rows.map(mapAct), total: totals.count, disputed: totals.disputed, signed: totals.signed });
+  res.json({
+    acts: rows.map((row) => mapAct(row, closed)),
+    total: totals.count,
+    disputed: totals.disputed,
+    signed: totals.signed,
+  });
 });
 
 /** Сводка для экрана закрытия месяца: что со сверкой в этом периоде. */
@@ -581,6 +637,9 @@ reconciliationsRouter.post('/', (req, res) => {
     return;
   }
 
+  // Ответственный берётся из карточки контрагента, а не из того, кто нажал
+  // кнопку: акт ведёт участок (см. mayEdit). Автор становится ответственным
+  // только у контрагента, за которым никто не закреплён.
   const responsible = db
     .prepare('SELECT responsible_user_id FROM counterparties WHERE id = ?')
     .get(counterpartyId) as { responsible_user_id: number | null };
@@ -751,8 +810,17 @@ reconciliationsRouter.patch('/:id(\\d+)/lines/:lineId(\\d+)', (req, res) => {
   }
 
   const { theirAmount, comment } = req.body as { theirAmount?: number | null; comment?: string };
-  if (theirAmount !== undefined && theirAmount !== null && !Number.isInteger(theirAmount)) {
-    res.status(400).json({ error: 'Сумма контрагента должна быть целым числом тиын' });
+  // Ноль легитимен — «у контрагента такой строки нет», это отдельный диагноз.
+  // Отрицательная сумма — нет: строка выписки её не бывает, а диагноз от неё
+  // становится бессмысленным, и порог главбуха при закрытии расхождения
+  // считается от модуля разности и раздувается. Ручное добавление строки
+  // требует того же (POST /lines).
+  if (
+    theirAmount !== undefined &&
+    theirAmount !== null &&
+    (!Number.isInteger(theirAmount) || theirAmount < 0)
+  ) {
+    res.status(400).json({ error: 'Сумма контрагента должна быть целым неотрицательным числом тиын' });
     return;
   }
 
@@ -1106,7 +1174,7 @@ reconciliationsRouter.post('/:id(\\d+)/transition', (req, res) => {
   }
 
   const ts = nowTimestamp();
-  db.transaction(() => {
+  const moved = db.transaction(() => {
     const fields: Record<string, unknown> = { status: to, updated_at: ts };
     if (to === 'sent') {
       fields.sent_at = ts;
@@ -1119,8 +1187,23 @@ reconciliationsRouter.post('/:id(\\d+)/transition', (req, res) => {
       fields.signed_by = user.id;
     }
     const setSql = Object.keys(fields).map((k) => `${k} = ?`).join(', ');
-    db.prepare(`UPDATE reconciliations SET ${setSql} WHERE id = ?`).run(...Object.values(fields), row.id);
+    // Условие на исходный статус — оптимистическая блокировка. Все проверки
+    // выше сделаны по прочитанной строке, и между чтением и записью статус
+    // мог сменить кто-то другой: две вкладки, два бухгалтера, повторная
+    // отправка формы. Без условия акт молча уезжал бы из статуса, для
+    // которого переход не проверяли, — например, подписывался бы дважды
+    // с потерей первой подписи.
+    const info = db
+      .prepare(`UPDATE reconciliations SET ${setSql} WHERE id = ? AND status = ?`)
+      .run(...Object.values(fields), row.id, row.status);
+    return info.changes === 1;
   })();
+  if (!moved) {
+    res.status(409).json({
+      error: 'Статус акта уже изменили — обновите страницу и посмотрите, что с ним стало',
+    });
+    return;
+  }
 
   logAudit({
     entityType: 'reconciliation',

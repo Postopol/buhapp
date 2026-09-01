@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, useId } from 'react';
 import { useParams, useNavigate, Link } from 'react-router-dom';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -17,14 +17,14 @@ import {
   formatMoney, formatDate, formatDateTime, dueLabel, formatFileSize, formatPeriod,
 } from '@/lib/format';
 import { ApprovalChip, OriginalChip, PaymentChip, PostingChip, Chip } from '@/components/StatusChips';
-import { DocumentFormModal } from '@/components/DocumentFormModal';
+import { DocumentFormModal, useModalChrome } from '@/components/DocumentFormModal';
 import {
   TRANSITIONS, DOC_TYPE_LABELS, SECTION_LABELS, ORIGINAL_STATUSES, ORIGINAL_LABELS,
   CHIEF_APPROVAL_THRESHOLD, MAX_ATTACHMENT_BYTES,
   type ApprovalStatus, type OriginalStatus,
 } from '@shared/domain';
 import { cn } from '@/lib/utils';
-import type { Dictionaries, DocumentDetail as DocDetail } from '@/types';
+import type { Attachment, Dictionaries, DocumentDetail as DocDetail } from '@/types';
 
 const ACTION_ICONS: Record<ApprovalStatus, typeof Send> = {
   review: Send,
@@ -49,6 +49,12 @@ const HISTORY_LABELS: Record<string, string> = {
 export function DocumentDetail() {
   const { id } = useParams<{ id: string }>();
   const documentId = Number(id);
+  /**
+   * `/documents/abc` — адрес из чужого письма или обрезанная ссылка. Слать такой
+   * id на сервер незачем, но и молчать нельзя: раньше эффект просто не звал
+   * load(), а `loading` оставался true, и человек навсегда видел спиннер.
+   */
+  const validId = Number.isInteger(documentId) && documentId > 0;
   const navigate = useNavigate();
   const { role } = useAuth();
 
@@ -61,24 +67,33 @@ export function DocumentDetail() {
   const [showEdit, setShowEdit] = useState(false);
 
   const [pendingAction, setPendingAction] = useState<{ to: ApprovalStatus; label: string; requiresComment: boolean } | null>(null);
-  const [actionComment, setActionComment] = useState('');
 
   const [commentDraft, setCommentDraft] = useState('');
   const [uploading, setUploading] = useState(false);
+  /** Какое вложение ждёт подтверждения удаления — см. `removeAttachment`. */
+  const [confirmAttachmentId, setConfirmAttachmentId] = useState<number | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
+  // Зависимость — сырой `id` из адреса, а не число: у NaN нет равенства самому
+  // себе, и на битой ссылке колбэк пересоздавался бы каждый рендер.
   const load = useCallback(() => {
     setLoading(true);
     setError('');
-    return getDocument(documentId)
+    return getDocument(Number(id))
       .then(({ document }) => setDoc(document))
       .catch((err) => setError(err instanceof Error ? err.message : 'Документ не найден'))
       .finally(() => setLoading(false));
-  }, [documentId]);
+  }, [id]);
 
   useEffect(() => {
-    if (Number.isFinite(documentId)) load();
-  }, [documentId, load]);
+    if (!validId) {
+      setDoc(null);
+      setError(`«${id}» — это не номер документа`);
+      setLoading(false);
+      return;
+    }
+    load();
+  }, [validId, id, load]);
 
   useEffect(() => {
     getDictionaries().then(setDictionaries).catch(() => setDictionaries(null));
@@ -100,8 +115,20 @@ export function DocumentDetail() {
           <ArrowLeft className="h-4 w-4" />
           К реестру
         </Button>
-        <div className="rounded-lg border border-red-200 bg-red-50 p-6 text-red-700">
+        <div className="space-y-3 rounded-lg border border-red-200 bg-red-50 p-6 text-red-700">
           <p className="font-medium">{error || 'Документ не найден'}</p>
+          <p className="text-sm text-red-600">
+            {validId
+              ? 'Возможно, документ удалён или он не в вашей видимости.'
+              : 'Похоже, ссылка обрезалась при пересылке. Найдите документ в реестре по номеру или контрагенту.'}
+          </p>
+          <Link
+            to="/documents"
+            className="inline-flex items-center gap-1.5 text-sm font-medium text-red-700 underline underline-offset-2"
+          >
+            <ArrowLeft className="h-4 w-4" />
+            Открыть реестр документов
+          </Link>
         </div>
       </div>
     );
@@ -122,6 +149,12 @@ export function DocumentDetail() {
     !(doc.approvalStatus === 'approved' && role !== 'chief_accountant') &&
     !(doc.approvalStatus === 'review' && role === 'initiator');
   const isAccounting = !frozen && (role === 'accountant' || role === 'chief_accountant');
+  /**
+   * Руководитель документ только смотрит и подписывать сканы не должен, а в
+   * закрытом периоде вложения не меняет никто — сервер такие запросы отклоняет,
+   * и показывать кнопки, которые заведомо вернут 403, незачем.
+   */
+  const canWriteAttachments = !frozen && role !== 'director';
 
   const runTransition = async (to: ApprovalStatus, comment: string) => {
     setActionError('');
@@ -129,7 +162,6 @@ export function DocumentDetail() {
     try {
       await transitionDocument(doc.id, to, comment);
       setPendingAction(null);
-      setActionComment('');
       await load();
     } catch (err) {
       setActionError(err instanceof ApiError ? err.message : 'Не удалось выполнить действие');
@@ -175,6 +207,28 @@ export function DocumentDetail() {
     } finally {
       setUploading(false);
       if (fileRef.current) fileRef.current.value = '';
+    }
+  };
+
+  /**
+   * Удаление вложения спрашивает подтверждение прямо в строке: корзина стоит
+   * вплотную к «Скачать», а скан первички восстановить неоткуда — оригинал
+   * лежит в папке, и второй раз его никто не сканирует.
+   */
+  const removeAttachment = async (file: Attachment) => {
+    setActionError('');
+    setBusy(true);
+    try {
+      await deleteAttachment(file.id);
+      setConfirmAttachmentId(null);
+      await load();
+    } catch (err) {
+      // Сервер отказывает по-разному: чужой файл, закрытый период, нет прав.
+      // Без этой ветки отказ уходил в необработанное отклонение промиса,
+      // файл оставался на месте, а пользователь этого не понимал.
+      setActionError(err instanceof ApiError ? err.message : 'Не удалось удалить файл');
+    } finally {
+      setBusy(false);
     }
   };
 
@@ -397,20 +451,22 @@ export function DocumentDetail() {
                 <CardTitle className="text-base">Вложения</CardTitle>
                 <CardDescription>Сканы счетов, актов и договоров</CardDescription>
               </div>
-              <div>
-                <input
-                  ref={fileRef}
-                  type="file"
-                  multiple
-                  className="hidden"
-                  onChange={(e) => handleUpload(e.target.files)}
-                  accept=".pdf,.jpg,.jpeg,.png,.webp,.doc,.docx,.xls,.xlsx"
-                />
-                <Button variant="outline" size="sm" className="gap-2" disabled={uploading} onClick={() => fileRef.current?.click()}>
-                  {uploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Paperclip className="h-4 w-4" />}
-                  Приложить
-                </Button>
-              </div>
+              {canWriteAttachments && (
+                <div>
+                  <input
+                    ref={fileRef}
+                    type="file"
+                    multiple
+                    className="hidden"
+                    onChange={(e) => handleUpload(e.target.files)}
+                    accept=".pdf,.jpg,.jpeg,.png,.webp,.doc,.docx,.xls,.xlsx"
+                  />
+                  <Button variant="outline" size="sm" className="gap-2" disabled={uploading} onClick={() => fileRef.current?.click()}>
+                    {uploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Paperclip className="h-4 w-4" />}
+                    Приложить
+                  </Button>
+                </div>
+              )}
             </CardHeader>
             <CardContent>
               {doc.attachments.length === 0 ? (
@@ -434,18 +490,36 @@ export function DocumentDetail() {
                           Скачать
                         </Button>
                       </a>
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        className="text-slate-400 hover:text-red-600"
-                        onClick={async () => {
-                          await deleteAttachment(file.id);
-                          load();
-                        }}
-                        title="Удалить"
-                      >
-                        <Trash2 className="h-4 w-4" />
-                      </Button>
+                      {canWriteAttachments &&
+                        (confirmAttachmentId === file.id ? (
+                          <div className="flex shrink-0 items-center gap-1">
+                            <Button variant="ghost" size="sm" onClick={() => setConfirmAttachmentId(null)}>
+                              Отмена
+                            </Button>
+                            <Button
+                              variant="destructive"
+                              size="sm"
+                              disabled={busy}
+                              onClick={() => removeAttachment(file)}
+                            >
+                              Удалить
+                            </Button>
+                          </div>
+                        ) : (
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className="shrink-0 text-slate-400 hover:text-red-600"
+                            onClick={() => {
+                              setActionError('');
+                              setConfirmAttachmentId(file.id);
+                            }}
+                            title="Удалить"
+                            aria-label={`Удалить «${file.filename}»`}
+                          >
+                            <Trash2 className="h-4 w-4" />
+                          </Button>
+                        ))}
                     </div>
                   ))}
                 </div>
@@ -564,33 +638,12 @@ export function DocumentDetail() {
 
       {/* Модалка действия с обязательной причиной */}
       {pendingAction && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4">
-          <div className="w-full max-w-md rounded-xl bg-white p-6 shadow-xl">
-            <h3 className="text-lg font-semibold text-slate-900">{pendingAction.label}</h3>
-            <p className="mt-1 text-sm text-slate-500">
-              Причина попадёт в карточку документа и увидится инициатору.
-            </p>
-            <textarea
-              className="mt-4 min-h-[100px] w-full rounded-md border border-slate-200 px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-950"
-              placeholder="Например: нет договора и акта — приложите документы"
-              value={actionComment}
-              onChange={(e) => setActionComment(e.target.value)}
-              autoFocus
-            />
-            <div className="mt-4 flex justify-end gap-2">
-              <Button variant="outline" onClick={() => { setPendingAction(null); setActionComment(''); }}>
-                Отмена
-              </Button>
-              <Button
-                disabled={busy || !actionComment.trim()}
-                onClick={() => runTransition(pendingAction.to, actionComment)}
-              >
-                {busy && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-                {pendingAction.label}
-              </Button>
-            </div>
-          </div>
-        </div>
+        <ReasonDialog
+          title={pendingAction.label}
+          busy={busy}
+          onClose={() => setPendingAction(null)}
+          onSubmit={(comment) => runTransition(pendingAction.to, comment)}
+        />
       )}
 
       {showEdit && dictionaries && (
@@ -604,6 +657,67 @@ export function DocumentDetail() {
           }}
         />
       )}
+    </div>
+  );
+}
+
+/**
+ * Возврат и отклонение без причины бессмысленны, поэтому причина спрашивается
+ * отдельным окном. Черновик причины живёт здесь, а не на странице: окно
+ * закрылось — недописанный текст ушёл вместе с ним.
+ */
+function ReasonDialog({
+  title,
+  busy,
+  onClose,
+  onSubmit,
+}: {
+  title: string;
+  busy: boolean;
+  onClose: () => void;
+  onSubmit: (comment: string) => void;
+}) {
+  const [comment, setComment] = useState('');
+  const titleId = useId();
+  const dialogRef = useModalChrome<HTMLDivElement>(onClose);
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4"
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        className="w-full max-w-md rounded-xl bg-white p-6 shadow-xl"
+      >
+        <h3 id={titleId} className="text-lg font-semibold text-slate-900">
+          {title}
+        </h3>
+        <p className="mt-1 text-sm text-slate-500">
+          Причина попадёт в карточку документа и увидится инициатору.
+        </p>
+        <textarea
+          className="mt-4 min-h-[100px] w-full rounded-md border border-slate-200 px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-950"
+          placeholder="Например: нет договора и акта — приложите документы"
+          value={comment}
+          onChange={(e) => setComment(e.target.value)}
+          autoFocus
+        />
+        <div className="mt-4 flex justify-end gap-2">
+          <Button variant="outline" onClick={onClose}>
+            Отмена
+          </Button>
+          <Button disabled={busy || !comment.trim()} onClick={() => onSubmit(comment)}>
+            {busy && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+            {title}
+          </Button>
+        </div>
+      </div>
     </div>
   );
 }

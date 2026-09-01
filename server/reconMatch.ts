@@ -27,18 +27,74 @@ export interface ParseResult {
   skipped: { raw: string; reason: string }[];
 }
 
+/** Пробелы-разряды: обычный, неразрывный и узкий неразрывный из Excel. */
+const SPACES = /[\s  ]/g;
+
+/** Разряды через запятую («3,400,000.00») и через точку («3.400.000,00»). */
+const GROUPED_BY_COMMA = /^-?\d{1,3}(,\d{3})+(\.\d+)?$/;
+const GROUPED_BY_DOT = /^-?\d{1,3}(\.\d{3})+(,\d+)?$/;
+
+/** Обозначения валюты, которые бухгалтер дописывает к сумме. */
+const CURRENCY_TAIL = /(₸|тенге|тнг|тг|kzt)$/i;
+
 /**
- * «1 250 000,50», «1250000.5», «1 250 000 ₸» → тиыны.
+ * Разделители к единому виду «1234.56».
+ *
+ * Запятая двулика: «3400,00» — это копейки, «3,400,000.00» — разряды.
+ * Различаем по числу и длине групп: одна запятая — дробная часть, несколько —
+ * разряды, и тогда каждая группа обязана быть ровно трёхзначной. «10,123» при
+ * таком правиле остаётся мусором намеренно: копеек в три знака не бывает, а
+ * гадать между «10 123» и «10,123» нельзя — промах в тысячу раз дороже отказа.
+ */
+function normalizeSeparators(s: string): string | null {
+  const commas = s.split(',').length - 1;
+  const dots = s.split('.').length - 1;
+  if (commas > 0 && dots > 0) {
+    // Оба знака сразу: дробный — тот, что правее, второй обязан быть разрядным.
+    if (s.lastIndexOf(',') > s.lastIndexOf('.')) {
+      return GROUPED_BY_DOT.test(s) ? s.split('.').join('').replace(',', '.') : null;
+    }
+    return GROUPED_BY_COMMA.test(s) ? s.split(',').join('') : null;
+  }
+  if (commas > 1) return GROUPED_BY_COMMA.test(s) ? s.split(',').join('') : null;
+  if (dots > 1) return GROUPED_BY_DOT.test(s) ? s.split('.').join('') : null;
+  return s.replace(',', '.');
+}
+
+/**
+ * «1 250 000,50», «1250000.5», «3,400,000.00», «1 250 000 ₸» → тиыны.
  * Неразрывный пробел из Excel встречается чаще обычного.
  */
 export function parseMoneyMinor(input: string): number | null {
   const cleaned = input
-    .replace(/[\s  ]/g, '')
-    .replace(/[₸тг]/gi, '')
-    .replace(',', '.');
+    .replace(SPACES, '')
+    // Валюту режем только с краю. Раньше «т» и «г» вырезались из любой позиции,
+    // и «5 т» (тонны из колонки количества) разбиралось как сумму 5 тенге,
+    // а первая же денежная ячейка становится начислением.
+    .replace(/^₸/, '')
+    .replace(CURRENCY_TAIL, '');
   if (!cleaned) return null;
-  if (!/^-?\d+(\.\d{1,2})?$/.test(cleaned)) return null;
-  return Math.round(parseFloat(cleaned) * 100);
+  const normalized = normalizeSeparators(cleaned);
+  if (normalized === null) return null;
+  if (!/^-?\d+(\.\d{1,2})?$/.test(normalized)) return null;
+  return Math.round(parseFloat(normalized) * 100);
+}
+
+/**
+ * Похоже ли содержимое ячейки на деньги, а не на количество или порядковый
+ * номер: копейки, разряды, символ валюты. Ноль тоже деньги — им в выписке
+ * отмечают пустую колонку («…;0;3 400 000,00»).
+ *
+ * Голое «5» деньгами не считаем: в выписке рядом с суммой стоит колонка
+ * количества, и она молча становилась начислением, а настоящая сумма
+ * съезжала в оплату — счёт превращался в платёж.
+ */
+function looksMonetary(cell: string, value: number): boolean {
+  if (value === 0) return true;
+  const compact = cell.replace(SPACES, '');
+  if (CURRENCY_TAIL.test(compact) || compact.startsWith('₸')) return true;
+  // Копейки («3400,00»), разряды через знак («3,400,000») или через пробел.
+  return /[.,]\d{1,2}$/.test(compact) || /\d[.,]\d{3}/.test(compact) || /\d[\s  ]\d{3}/.test(cell);
 }
 
 /** «13.08.2026», «13/08/2026», «2026-08-13» → «2026-08-13». */
@@ -104,6 +160,11 @@ export function parseImportText(text: string, defaultKind: 'accrued' | 'paid' = 
     // колонка и есть смысл — сумма стоит в «оплачено». Отбросив её, мы бы
     // сдвинули колонки и записали оплату в начисление.
     const cells = raw.split(sep).map((c) => c.trim());
+    // Но хвостовые пустые ячейки смысла не несут: «…;3400,00;» — это след
+    // завершающего разделителя, а не колонка. Оставив их, мы получали «пусто
+    // и до, и после», обе ветки направления молчали, и оплата уходила в
+    // начисление значением по умолчанию.
+    while (cells.length > 0 && cells[cells.length - 1] === '') cells.pop();
     const filled = cells.filter((c) => c !== '');
     if (filled.length < 2) {
       skipped.push({ raw, reason: 'меньше двух колонок' });
@@ -111,11 +172,16 @@ export function parseImportText(text: string, defaultKind: 'accrued' | 'paid' = 
     }
     const date = cells.map(parseDateLoose).find((d) => d !== null) ?? null;
 
-    // Шапка таблицы: слова вместо чисел и никакой даты. Дата — верный признак
-    // строки с данными: без этого условия «15.06.2026 ПП-341 оплачено частично
-    // 3,400,000.00» (сумма в неразбираемом формате) уходила бы в шапку и
-    // исчезала бесследно вместо честного «не нашли сумму».
-    if (!date && !filled.some((c) => parseMoneyMinor(c) !== null) && HEADER_WORDS.test(raw)) {
+    // Шапка таблицы: слова вместо чисел и никакой даты. Цифр в шапке не бывает
+    // вовсе — а вот в строке данных без даты они есть всегда (номер документа).
+    // Без этой оговорки «ПП-341 [таб] оплачено [таб] <сумма в неизвестном виде>»
+    // считалась шапкой и исчезала бесследно вместо честного «не нашли сумму».
+    if (
+      !date &&
+      !filled.some((c) => parseMoneyMinor(c) !== null) &&
+      !filled.some((c) => /\d/.test(c)) &&
+      HEADER_WORDS.test(raw)
+    ) {
       continue;
     }
     if (TOTAL_WORDS.test(raw)) {
@@ -123,9 +189,17 @@ export function parseImportText(text: string, defaultKind: 'accrued' | 'paid' = 
       continue;
     }
 
-    const moneyCells = cells
-      .map((cell, index) => ({ value: parseMoneyMinor(cell), index }))
-      .filter((c) => c.value !== null && !isDateCell(cells[c.index]));
+    const numeric: { cell: string; index: number; value: number }[] = [];
+    cells.forEach((cell, index) => {
+      if (cell === '' || isDateCell(cell)) return;
+      const value = parseMoneyMinor(cell);
+      if (value !== null) numeric.push({ cell, index, value });
+    });
+    // Из разбираемых чисел суммами считаем те, что и выглядят суммами. Голые
+    // числа берём, только если денежных на вид ячеек в строке нет вообще —
+    // иначе колонка количества («…;СЧ-441;5;1 250 000,00») подменяла начисление.
+    const monetary = numeric.filter((c) => looksMonetary(c.cell, c.value));
+    const moneyCells = monetary.length > 0 ? monetary : numeric;
 
     if (moneyCells.length === 0) {
       skipped.push({ raw, reason: 'не нашли сумму' });
@@ -144,19 +218,27 @@ export function parseImportText(text: string, defaultKind: 'accrued' | 'paid' = 
     let accrued = 0;
     let paid = 0;
     if (moneyCells.length >= 2) {
-      accrued = (moneyCells[0].value as number) || 0;
-      paid = (moneyCells[1].value as number) || 0;
+      accrued = moneyCells[0].value;
+      paid = moneyCells[1].value;
     } else {
       // Одна сумма. Соседняя пустая ячейка говорит, из какой она колонки:
       // «…;;3400,00» — оплата, «…;3400,00;» — начисление.
-      const only = moneyCells[0].value as number;
+      const only = moneyCells[0].value;
       const at = moneyCells[0].index;
-      const emptyBefore = at > 0 && cells[at - 1] === '' && !isDateCell(cells[at - 1]);
+      const emptyBefore = at > 0 && cells[at - 1] === '';
       const emptyAfter = at < cells.length - 1 && cells[at + 1] === '';
       if (emptyBefore && !emptyAfter) paid = only;
       else if (emptyAfter && !emptyBefore) accrued = only;
       else if (defaultKind === 'accrued') accrued = only;
       else paid = only;
+    }
+    // Сторно выписки (возврат, аннулированный акт) разобрать мало — его нужно
+    // ещё правильно провести, а знака в акте сверки нет: строка с минусом
+    // уехала бы в начисления с нулевой суммой и дала случайный диагноз.
+    // Честнее вернуть её бухгалтеру.
+    if (accrued < 0 || paid < 0) {
+      skipped.push({ raw, reason: 'отрицательная сумма (сторно) — заведите строку вручную' });
+      continue;
     }
     if (accrued === 0 && paid === 0) {
       skipped.push({ raw, reason: 'нулевая сумма' });
@@ -204,6 +286,27 @@ export interface MatchResult {
 }
 
 /**
+ * Совпадение номера, а не куска номера. Через `includes()` номер контрагента
+ * «12» подходил к нашему «Счёт СЧ-4412»: требуем, чтобы цифры ключа не
+ * оказались обрывком более длинного числа — с той стороны, где у ключа цифра,
+ * соседний символ цифрой быть не должен.
+ */
+function numberMatches(ourTitle: string, key: string): boolean {
+  const hay = normalizeNumber(ourTitle);
+  const digit = (c: string) => c !== '' && c >= '0' && c <= '9';
+  let at = hay.indexOf(key);
+  while (at >= 0) {
+    const before = at > 0 ? hay[at - 1] : '';
+    const after = at + key.length < hay.length ? hay[at + key.length] : '';
+    const startOk = !digit(key[0]) || !digit(before);
+    const endOk = !digit(key[key.length - 1]) || !digit(after);
+    if (startOk && endOk) return true;
+    at = hay.indexOf(key, at + 1);
+  }
+  return false;
+}
+
+/**
  * Три прохода, каждая наша строка занимается не больше одного раза:
  *   1) совпал номер и сумма — самый надёжный случай;
  *   2) совпал номер (сумма разошлась) либо совпал хвост цифр номера;
@@ -215,8 +318,21 @@ export function matchRows(ours: OurRow[], theirs: TheirRow[], dateToleranceDays 
   const taken = new Set<number>();
   const pairs: MatchPair[] = [];
 
-  const theirKind = (row: TheirRow) => (row.paid > 0 ? 'payment' : 'document');
-  const theirAmountOf = (row: TheirRow) => (row.paid > 0 ? row.paid : row.accrued);
+  // Свёрнутая строка оборотки — «акт на 100 000, оплачено 100 000» одной
+  // строкой — несёт сразу два факта. Вид строки определяется по оплате, и
+  // начисленная половина пропадала из акта без предупреждения. Расщепляем:
+  // каждая половина ищет свою пару, и расхождение по любой из них видно.
+  const rows: TheirRow[] = [];
+  for (const row of theirs) {
+    if (row.accrued > 0 && row.paid > 0) rows.push({ ...row, paid: 0 }, { ...row, accrued: 0 });
+    else rows.push(row);
+  }
+
+  // Вид строки — по самому факту оплаты, а не по её знаку: сторно
+  // parseImportText отклоняет, но заведённая руками отрицательная оплата
+  // иначе уехала бы в начисления с нулевой суммой.
+  const theirKind = (row: TheirRow) => (row.paid !== 0 ? 'payment' : 'document');
+  const theirAmountOf = (row: TheirRow) => (row.paid !== 0 ? row.paid : row.accrued);
 
   const candidates = (row: TheirRow) =>
     ours.filter((o) => !taken.has(o.id) && o.kind === theirKind(row));
@@ -226,28 +342,34 @@ export function matchRows(ours: OurRow[], theirs: TheirRow[], dateToleranceDays 
     pairs.push({ ourId, their: row, theirAmount: theirAmountOf(row) });
   };
 
-  // Номер короче двух знаков ни о чём не говорит: пустой ключ через
-  // includes() совпал бы с любой строкой и дал ложное «сходится».
+  // Короткий номер ни о чём не говорит: «12» встречается внутри половины наших
+  // номеров, и такой ключ давал ложное «сходится» по чужому документу.
   const keyOf = (row: TheirRow) => {
     const key = normalizeNumber(row.number);
-    return key.length >= 2 ? key : '';
+    return key.length >= 3 ? key : '';
   };
 
   const passes: ((row: TheirRow) => OurRow | undefined)[] = [
     (row) => {
       const key = keyOf(row);
       if (!key) return undefined;
+      // Совпали и номер, и сумма: даже если таких строк у нас две, они
+      // неразличимы, и любая из них одинаково верна.
       return candidates(row).find(
-        (o) => normalizeNumber(o.title).includes(key) && o.amount === theirAmountOf(row)
+        (o) => numberMatches(o.title, key) && o.amount === theirAmountOf(row)
       );
     },
     (row) => {
       const key = keyOf(row);
       const tail = digitTail(row.number);
       if (!key && !tail) return undefined;
-      return candidates(row).find(
-        (o) => (key !== '' && normalizeNumber(o.title).includes(key)) || (tail !== '' && digitTail(o.title) === tail)
+      // Здесь сумма уже разошлась, и пара держится на одном номере. Кандидат
+      // обязан быть единственным: выбрав первого из двух подходящих, мы бы
+      // приписали расхождение произвольно выбранному документу.
+      const fits = candidates(row).filter(
+        (o) => (key !== '' && numberMatches(o.title, key)) || (tail !== '' && digitTail(o.title) === tail)
       );
+      return fits.length === 1 ? fits[0] : undefined;
     },
     (row) => {
       if (!row.date) return undefined;
@@ -263,7 +385,7 @@ export function matchRows(ours: OurRow[], theirs: TheirRow[], dateToleranceDays 
 
   // Проходы идут по всем строкам целиком: сначала все точные совпадения,
   // и только потом приблизительные — иначе первая же строка растащит пары.
-  const rest = [...theirs];
+  const rest = [...rows];
   for (const pass of passes) {
     for (let i = rest.length - 1; i >= 0; i--) {
       const found = pass(rest[i]);

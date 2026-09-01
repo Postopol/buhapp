@@ -32,10 +32,17 @@ export function formatAmount(minor: number): string {
   return plain.format(minor / 100);
 }
 
-/** Пользовательский ввод «1 250 000,50» → тиыны. */
-export function parseMoney(input: string): number | null {
-  const cleaned = input.replace(/\s| /g, '').replace(',', '.');
-  if (!cleaned || !/^\d+(\.\d{0,2})?$/.test(cleaned)) return null;
+/** Пользовательский ввод «1 250 000,50» → тиыны.
+ *
+ *  Минус по умолчанию не проходит: в сумме документа или платежа он опечатка.
+ *  Но там, где отрицательное значение осмысленно — сальдо контрагента при
+ *  авансе или переплате, — его надо уметь внести, для таких полей allowNegative.
+ *  Типографский минус принимаем наравне с дефисом: суммы копируют из письма или
+ *  Excel, а оттуда он приходит именно в таком виде. */
+export function parseMoney(input: string, options?: { allowNegative?: boolean }): number | null {
+  const cleaned = input.replace(/\s| /g, '').replace(',', '.').replace(/^[−–—]/, '-');
+  const shape = options?.allowNegative ? /^-?\d+(\.\d{0,2})?$/ : /^\d+(\.\d{0,2})?$/;
+  if (!cleaned || !shape.test(cleaned)) return null;
   return Math.round(parseFloat(cleaned) * 100);
 }
 
@@ -49,14 +56,17 @@ const MONTHS_NOM = [
   'Июль', 'Август', 'Сентябрь', 'Октябрь', 'Ноябрь', 'Декабрь',
 ];
 
-/** YYYY-MM-DD → «13 августа». Год добавляется, только если он не текущий. */
-export function formatDate(iso: string | null): string {
+/** YYYY-MM-DD → «13 августа». Год добавляется, только если он не текущий.
+ *  alwaysYear — для дат, у которых нет контекста периода вокруг: границы акта
+ *  сверки и строки его оборотов бывают за прошлый год, а «15 июля» без года
+ *  читается как за этот. */
+export function formatDate(iso: string | null, alwaysYear = false): string {
   if (!iso) return '—';
   const [y, m, d] = iso.slice(0, 10).split('-').map(Number);
   if (!y || !m || !d) return iso;
   const currentYear = new Date().getFullYear();
   const base = `${d} ${MONTHS[m - 1]}`;
-  return y === currentYear ? base : `${base} ${y}`;
+  return !alwaysYear && y === currentYear ? base : `${base} ${y}`;
 }
 
 /** YYYY-MM-DD HH:MM:SS → «13 августа, 14:32». */

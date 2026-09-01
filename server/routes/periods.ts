@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { db, nowTimestamp, currentPeriod, logAudit, ensurePeriod } from '../db';
 import { requireAuth, requireRole } from '../auth';
-import { PERIOD_STATUS_LABELS, type PeriodStatus } from '../../shared/domain';
+import { PERIOD_RE, PERIOD_STATUS_LABELS, type PeriodStatus } from '../../shared/domain';
 
 export const periodsRouter = Router();
 
@@ -9,15 +9,18 @@ periodsRouter.use(requireAuth);
 // Закрытие месяца — работа бухгалтерии, инициатору здесь делать нечего.
 periodsRouter.use(requireRole('accountant', 'chief_accountant', 'director'));
 
-const PERIOD_RE = /^\d{4}-\d{2}$/;
-
 interface Blocker {
   key: string;
   title: string;
   hint: string;
   count: number;
   amount: number;
-  /** Параметры, с которыми откроется реестр. */
+  /**
+   * Экран, на котором цифру видно целиком. Не всякая блокировка живёт
+   * в реестре документов: неразнесённые платежи там не показываются вовсе.
+   */
+  route: string;
+  /** Параметры, с которыми откроется этот экран. */
   filter: Record<string, string>;
 }
 
@@ -57,7 +60,10 @@ function blockersOf(period: string): Blocker[] {
       hint: 'Черновики, документы на проверке и возвращённые на доработку',
       count: unfinished.count,
       amount: unfinished.amount,
-      filter: { period, approval: 'review' },
+      // Перечисляем ровно те же три статуса, что и в счётчике: фильтр
+      // «только на проверке» открывал список короче цифры на плитке.
+      route: '/documents',
+      filter: { period, approval: 'draft,review,returned' },
     },
     {
       key: 'originals',
@@ -65,7 +71,10 @@ function blockersOf(period: string): Blocker[] {
       hint: 'Без бумаги документ нельзя принять к учёту',
       count: originals.count,
       amount: originals.amount,
-      filter: { period, original: 'none' },
+      route: '/documents',
+      // Счётчик не считает отклонённые — бумага по ним уже не нужна;
+      // перечисляем в фильтре все остальные статусы, чтобы список сошёлся с цифрой.
+      filter: { period, original: 'none', approval: 'draft,review,returned,approved' },
     },
     {
       key: 'not_posted',
@@ -73,15 +82,19 @@ function blockersOf(period: string): Blocker[] {
       hint: 'Документы не переданы в учётную систему',
       count: notPosted.count,
       amount: notPosted.amount,
+      route: '/documents',
       filter: { period, approval: 'approved', posting: 'not_posted' },
     },
     {
       key: 'unallocated',
       title: 'Платежи не разнесены полностью',
-      hint: 'Деньги ушли, но не привязаны к документам',
+      hint: 'Деньги ушли, но не привязаны к документам — разнести можно в истории оплат',
       count: unallocated.count,
       amount: unallocated.amount,
-      filter: { period },
+      // Это единственная блокировка, которая считается не по документам,
+      // а по платежам: в реестре документов такой строки просто нет.
+      route: '/payments',
+      filter: { tab: 'history' },
     },
   ];
 }

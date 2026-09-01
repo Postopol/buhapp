@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect } from 'react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Bookmark, BookmarkPlus, Trash2, Users, X, Loader2, Pencil } from 'lucide-react';
@@ -13,6 +13,12 @@ interface Props {
   /** Текущий фильтр реестра — то, что предлагается сохранить. */
   current: Record<string, string>;
   onApply: (query: Record<string, string>) => void;
+  /**
+   * Меняется, когда реестр изменился (массовое согласование, сохранение документа).
+   * Счётчики считаются на сервере в момент запроса, поэтому без такого сигнала
+   * цифра на плитке осталась бы от прошлого состояния и разошлась бы со списком.
+   */
+  reloadKey?: number;
 }
 
 /** Два фильтра совпадают, если совпадает набор пар ключ-значение. */
@@ -23,22 +29,28 @@ function sameQuery(a: Record<string, string>, b: Record<string, string>): boolea
   return ka.every((key, i) => key === kb[i] && a[key] === b[key]);
 }
 
-export function SavedViews({ current, onApply }: Props) {
+export function SavedViews({ current, onApply, reloadKey = 0 }: Props) {
   const { role } = useAuth();
   const [views, setViews] = useState<SavedView[]>([]);
   const [error, setError] = useState('');
   const [showSave, setShowSave] = useState(false);
   const [editing, setEditing] = useState<SavedView | null>(null);
 
-  const load = useCallback(() => {
-    listViews()
-      .then(({ views }) => setViews(views))
-      .catch(() => setViews([]));
-  }, []);
-
   useEffect(() => {
-    load();
-  }, [load]);
+    // Отсечка на случай, если сигналов пришло несколько подряд: ответ на старый
+    // запрос не должен вернуть на плитки уже неактуальные счётчики.
+    let cancelled = false;
+    listViews()
+      .then(({ views }) => {
+        if (!cancelled) setViews(views);
+      })
+      .catch(() => {
+        if (!cancelled) setViews([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [reloadKey]);
 
   const hasFilter = Object.keys(current).length > 0;
   const active = views.find((v) => sameQuery(v.query, current));
@@ -70,8 +82,10 @@ export function SavedViews({ current, onApply }: Props) {
               )}
             >
               <button
+                type="button"
                 onClick={() => onApply(view.query)}
-                className="flex items-center gap-2 py-1.5 pl-2.5 pr-2"
+                aria-pressed={isActive}
+                className="flex items-center gap-2 rounded-md py-1.5 pl-2.5 pr-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-slate-950"
                 title={view.shared ? `Общий фильтр — ${view.ownerName}` : 'Личный фильтр'}
               >
                 {view.shared ? (
@@ -97,18 +111,31 @@ export function SavedViews({ current, onApply }: Props) {
                 </span>
               </button>
               {view.mine && (
-                <div className="flex items-center pr-1 opacity-0 transition-opacity group-hover:opacity-100">
+                // Кнопки прячутся до наведения, но фокус с клавиатуры мышью не
+                // сопровождается — focus-within проявляет их, иначе Tab уходил бы
+                // на невидимые кнопки удаления.
+                <div className="flex items-center pr-1 opacity-0 transition-opacity focus-within:opacity-100 group-hover:opacity-100">
                   <button
+                    type="button"
                     onClick={() => setEditing(view)}
-                    className={cn('rounded p-1', isActive ? 'hover:bg-slate-700' : 'hover:bg-slate-100')}
+                    className={cn(
+                      'rounded p-1 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset',
+                      isActive ? 'hover:bg-slate-700 focus-visible:ring-white' : 'hover:bg-slate-100 focus-visible:ring-slate-950'
+                    )}
                     title="Переименовать"
+                    aria-label={`Переименовать фильтр «${view.name}»`}
                   >
                     <Pencil className="h-3 w-3" />
                   </button>
                   <button
+                    type="button"
                     onClick={() => remove(view)}
-                    className={cn('rounded p-1', isActive ? 'hover:bg-slate-700' : 'hover:bg-slate-100')}
+                    className={cn(
+                      'rounded p-1 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset',
+                      isActive ? 'hover:bg-slate-700 focus-visible:ring-white' : 'hover:bg-slate-100 focus-visible:ring-slate-950'
+                    )}
                     title="Удалить"
+                    aria-label={`Удалить фильтр «${view.name}»`}
                   >
                     <Trash2 className="h-3 w-3" />
                   </button>

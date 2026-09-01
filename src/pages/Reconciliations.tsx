@@ -9,7 +9,7 @@ import { useAuth } from '@/context/AuthContext';
 import { listReconciliations, createReconciliation, previewReconciliation } from '@/services/reconciliations';
 import { getDictionaries } from '@/services/directory';
 import { ApiError } from '@/services/api';
-import { formatMoney, formatAmount } from '@/lib/format';
+import { formatMoney, formatAmount, formatDate } from '@/lib/format';
 import { ReconciliationChip } from '@/components/StatusChips';
 import { RECONCILIATION_STATUS_LABELS, type ReconciliationStatus } from '@shared/domain';
 import { cn } from '@/lib/utils';
@@ -175,7 +175,9 @@ export function Reconciliations() {
                         <div className="font-mono text-xs text-slate-400">{act.counterpartyBin}</div>
                       </TableCell>
                       <TableCell className="whitespace-nowrap px-2 py-2 text-sm text-slate-500">
-                        {act.from} — {act.to}
+                        {/* Годы пишем явно: в реестре рядом лежат акты за
+                            разные годы, и «1 июля» без года ни о чём. */}
+                        {formatDate(act.from, true)} — {formatDate(act.to, true)}
                       </TableCell>
                       <TableCell className="whitespace-nowrap px-2 py-2 text-right font-medium tabular-nums">
                         {formatAmount(act.closing)}

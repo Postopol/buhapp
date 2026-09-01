@@ -1,11 +1,12 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { useSearchParams, useNavigate } from 'react-router-dom';
+import { Link, useSearchParams, useNavigate } from 'react-router-dom';
 import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import {
   Search, Plus, Download, Loader2, CheckCheck, Undo2, X, ChevronLeft, ChevronRight, SlidersHorizontal,
+  ArrowDown, ArrowUp, ChevronsUpDown,
 } from 'lucide-react';
 import { useAuth } from '@/context/AuthContext';
 import { listDocuments, bulkTransition, exportUrl, type DocumentFilters } from '@/services/documents';
@@ -28,6 +29,22 @@ const FILTER_KEYS = [
   'posting', 'counterparty', 'period', 'overdue', 'mine', 'sort', 'dir',
 ] as const;
 
+/**
+ * Колонки, которые умеет сортировать сервер (SORTABLE в server/routes/documents.ts),
+ * и направление первого клика: даты и суммы бухгалтер смотрит от больших к меньшим,
+ * тексты — по алфавиту, а срок оплаты — от ближайшего, иначе просроченные уедут вниз.
+ */
+const SORT_COLUMNS: Record<string, 'asc' | 'desc'> = {
+  docDate: 'desc',
+  number: 'asc',
+  counterparty: 'asc',
+  amount: 'desc',
+  dueDate: 'asc',
+};
+
+/** Сервер без параметров сортирует по дате документа вниз — стрелка должна это показывать. */
+const DEFAULT_SORT = 'docDate';
+
 export function Documents() {
   const { role } = useAuth();
   const navigate = useNavigate();
@@ -38,7 +55,12 @@ export function Documents() {
   const [error, setError] = useState('');
   const [dictionaries, setDictionaries] = useState<Dictionaries | null>(null);
 
-  const [selected, setSelected] = useState<Set<number>>(new Set());
+  /**
+   * Выделение переживает смену страницы, поэтому рядом с id храним сумму документа:
+   * иначе подпись «Выбрано 8 документов» стояла бы рядом с суммой только тех,
+   * что видны сейчас, и бухгалтер увёл бы в работу неверную цифру.
+   */
+  const [selected, setSelected] = useState<Map<number, number>>(new Map());
   const [showFilters, setShowFilters] = useState(false);
   const [showCreate, setShowCreate] = useState(false);
   const [bulkAction, setBulkAction] = useState<'approved' | 'returned' | null>(null);
@@ -48,6 +70,9 @@ export function Documents() {
 
   const searchRef = useRef<HTMLInputElement>(null);
   const [searchDraft, setSearchDraft] = useState(params.get('search') ?? '');
+
+  /** Сигнал плиткам сохранённых фильтров: реестр изменился, счётчики пора пересчитать. */
+  const [viewsReloadKey, setViewsReloadKey] = useState(0);
 
   const offset = Number(params.get('offset') ?? 0);
 
@@ -76,17 +101,36 @@ export function Documents() {
     return () => clearTimeout(timer);
   }, [searchDraft, params, setParams]);
 
-  const load = useCallback(() => {
+  /**
+   * Фильтры переключают быстрее, чем отвечает сервер. Без отсечки ответ на
+   * прошлый запрос перезапишет таблицу и итоги, которые уже относятся к другому
+   * URL, а его finally погасит loading, пока новый запрос ещё летит. Поэтому у
+   * каждого запроса свой номер, и результат принимает только самый свежий.
+   */
+  const requestSeq = useRef(0);
+
+  const load = useCallback(async () => {
+    const seq = ++requestSeq.current;
     setLoading(true);
     setError('');
-    return listDocuments(filters)
-      .then((res) => setData(res))
-      .catch((err) => setError(err instanceof Error ? err.message : 'Не удалось загрузить документы'))
-      .finally(() => setLoading(false));
+    try {
+      const res = await listDocuments(filters);
+      if (seq !== requestSeq.current) return;
+      setData(res);
+    } catch (err) {
+      if (seq !== requestSeq.current) return;
+      setError(err instanceof Error ? err.message : 'Не удалось загрузить документы');
+    } finally {
+      if (seq === requestSeq.current) setLoading(false);
+    }
   }, [filters]);
 
   useEffect(() => {
     load();
+    // Размонтирование и смена фильтра одинаково обесценивают летящий ответ.
+    return () => {
+      requestSeq.current++;
+    };
   }, [load]);
 
   useEffect(() => {
@@ -102,7 +146,7 @@ export function Documents() {
         e.preventDefault();
         searchRef.current?.focus();
       }
-      if (e.key === 'Escape' && !typing) setSelected(new Set());
+      if (e.key === 'Escape' && !typing) setSelected(new Map());
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
@@ -116,13 +160,36 @@ export function Documents() {
       next.delete('offset');
       return next;
     });
-    setSelected(new Set());
+    setSelected(new Map());
   };
 
   const resetFilters = () => {
     setSearchDraft('');
     setParams(new URLSearchParams());
-    setSelected(new Set());
+    setSelected(new Map());
+  };
+
+  // Незнакомый sort из чужой ссылки сервер молча заменит на дату документа —
+  // стрелка в заголовке должна показывать то же, а не «сортировки нет».
+  const rawSort = params.get('sort');
+  const sortKey = rawSort && rawSort in SORT_COLUMNS ? rawSort : DEFAULT_SORT;
+  const sortDir: 'asc' | 'desc' = params.get('dir') === 'asc' ? 'asc' : 'desc';
+
+  /**
+   * Сортировка меняет только порядок, а не состав выборки, поэтому выделение
+   * не сбрасываем — в отличие от смены фильтра. Страницу же начинаем сначала:
+   * третья страница другого порядка ничего общего с прежней не имеет.
+   */
+  const toggleSort = (column: string) => {
+    const nextDir =
+      sortKey === column ? (sortDir === 'asc' ? 'desc' : 'asc') : (SORT_COLUMNS[column] ?? 'desc');
+    setParams((prev) => {
+      const next = new URLSearchParams(prev);
+      next.set('sort', column);
+      next.set('dir', nextDir);
+      next.delete('offset');
+      return next;
+    });
   };
 
   const activeFilterCount = FILTER_KEYS.filter(
@@ -142,36 +209,49 @@ export function Documents() {
   const applyView = (query: Record<string, string>) => {
     setSearchDraft(query.search ?? '');
     setParams(new URLSearchParams(query));
-    setSelected(new Set());
+    setSelected(new Map());
   };
 
   const documents = data?.documents ?? [];
-  const allSelected = documents.length > 0 && documents.every((d) => selected.has(d.id));
+  const selectedOnPage = documents.filter((d) => selected.has(d.id)).length;
+  const allSelected = documents.length > 0 && selectedOnPage === documents.length;
+
+  // Частичное выделение страницы честнее показывать «квадратиком»: пустая галка
+  // рядом с половиной отмеченных строк читается как «ничего не выбрано».
+  // indeterminate живёт только в DOM, атрибутом его не задать — отсюда ref.
+  const partlySelected = selectedOnPage > 0 && !allSelected;
+  const selectAllRef = useCallback(
+    (node: HTMLInputElement | null) => {
+      if (node) node.indeterminate = partlySelected;
+    },
+    [partlySelected]
+  );
 
   const toggleAll = () => {
     setSelected((prev) => {
-      if (allSelected) {
-        const next = new Set(prev);
-        documents.forEach((d) => next.delete(d.id));
-        return next;
-      }
-      return new Set([...prev, ...documents.map((d) => d.id)]);
-    });
-  };
-
-  const toggleOne = (id: number) => {
-    setSelected((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
+      const next = new Map(prev);
+      if (allSelected) documents.forEach((d) => next.delete(d.id));
+      else documents.forEach((d) => next.set(d.id, d.amount));
       return next;
     });
   };
 
-  // Сумма по выделенным — то, за чем бухгалтер обычно лезет в Excel.
-  const selectedSum = documents
-    .filter((d) => selected.has(d.id))
-    .reduce((sum, d) => sum + d.amount, 0);
+  const toggleOne = (doc: Document) => {
+    setSelected((prev) => {
+      const next = new Map(prev);
+      if (next.has(doc.id)) next.delete(doc.id);
+      else next.set(doc.id, doc.amount);
+      return next;
+    });
+  };
+
+  // Сумма по выделенным — то, за чем бухгалтер обычно лезет в Excel. Считается по
+  // всему выделению, включая строки с других страниц: цифра и подпись должны сойтись.
+  const selectedSum = useMemo(() => {
+    let sum = 0;
+    for (const amount of selected.values()) sum += amount;
+    return sum;
+  }, [selected]);
 
   const canBulk = role === 'accountant' || role === 'chief_accountant';
 
@@ -181,7 +261,7 @@ export function Documents() {
     setBulkBusy(true);
     setBulkResult(null);
     try {
-      const res = await bulkTransition([...selected], bulkAction, bulkComment);
+      const res = await bulkTransition([...selected.keys()], bulkAction, bulkComment);
       const parts: string[] = [];
       if (res.applied.length) {
         parts.push(`Обработано: ${plural(res.applied.length, 'документ', 'документа', 'документов')}`);
@@ -191,10 +271,13 @@ export function Documents() {
         parts.push(`Пропущено ${res.skipped.length} — ${reasons}`);
       }
       setBulkResult(parts.join('. ') || 'Ничего не изменилось');
-      setSelected(new Set());
+      setSelected(new Map());
       setBulkAction(null);
       setBulkComment('');
       await load();
+      // Согласование перекладывает документы между сохранёнными фильтрами:
+      // цифра на плитке не должна разойтись с тем, что покажет список.
+      setViewsReloadKey((k) => k + 1);
     } catch (err) {
       setBulkResult(err instanceof ApiError ? err.message : 'Не удалось выполнить действие');
     } finally {
@@ -241,7 +324,7 @@ export function Documents() {
       </div>
 
       {/* Сохранённые фильтры со счётчиками — личная панель работы */}
-      <SavedViews current={currentQuery} onApply={applyView} />
+      <SavedViews current={currentQuery} onApply={applyView} reloadKey={viewsReloadKey} />
 
       <Card>
         <CardContent className="space-y-4 p-4">
@@ -354,6 +437,12 @@ export function Documents() {
                 Выбрано {plural(selected.size, 'документ', 'документа', 'документов')}
               </span>
               <span className="text-sm tabular-nums text-slate-300">на {formatMoneyShort(selectedSum)}</span>
+              {/* Иначе непонятно, почему выбрано больше, чем видно отмеченных строк. */}
+              {selected.size > selectedOnPage && (
+                <span className="text-xs text-slate-400">
+                  из них {selected.size - selectedOnPage} на других страницах
+                </span>
+              )}
               <div className="ml-auto flex gap-2">
                 {canBulk && (
                   <>
@@ -367,7 +456,7 @@ export function Documents() {
                     </Button>
                   </>
                 )}
-                <Button size="sm" variant="ghost" className="text-slate-300 hover:bg-slate-800 hover:text-white" onClick={() => setSelected(new Set())}>
+                <Button size="sm" variant="ghost" className="text-slate-300 hover:bg-slate-800 hover:text-white" onClick={() => setSelected(new Map())}>
                   Снять
                 </Button>
               </div>
@@ -401,20 +490,23 @@ export function Documents() {
                     <TableRow>
                       <TableHead className="w-8 px-2">
                         <input
+                          ref={selectAllRef}
                           type="checkbox"
                           className="h-4 w-4 cursor-pointer rounded border-slate-300"
                           checked={allSelected}
                           onChange={toggleAll}
-                          aria-label="Выделить все"
+                          aria-label={
+                            allSelected ? 'Снять выделение со страницы' : 'Выделить все на странице'
+                          }
                         />
                       </TableHead>
-                      <TableHead className="px-2">Дата</TableHead>
-                      <TableHead className="px-2">Документ</TableHead>
-                      <TableHead className="px-2">Контрагент</TableHead>
-                      <TableHead className="px-2 text-right">Сумма</TableHead>
+                      <SortHeader column="docDate" label="Дата" sort={sortKey} dir={sortDir} onSort={toggleSort} />
+                      <SortHeader column="number" label="Документ" sort={sortKey} dir={sortDir} onSort={toggleSort} />
+                      <SortHeader column="counterparty" label="Контрагент" sort={sortKey} dir={sortDir} onSort={toggleSort} />
+                      <SortHeader column="amount" label="Сумма" sort={sortKey} dir={sortDir} onSort={toggleSort} align="right" />
                       <TableHead className="px-2 text-right">НДС</TableHead>
                       <TableHead className="px-2">Статья</TableHead>
-                      <TableHead className="px-2">Срок</TableHead>
+                      <SortHeader column="dueDate" label="Срок" sort={sortKey} dir={sortDir} onSort={toggleSort} />
                       <TableHead className="px-2">Статусы</TableHead>
                     </TableRow>
                   </TableHeader>
@@ -431,8 +523,7 @@ export function Documents() {
                           key={doc.id}
                           doc={doc}
                           checked={selected.has(doc.id)}
-                          onToggle={() => toggleOne(doc.id)}
-                          onOpen={() => navigate(`/documents/${doc.id}`)}
+                          onToggle={() => toggleOne(doc)}
                         />
                       ))
                     )}
@@ -475,6 +566,9 @@ export function Documents() {
           onClose={() => setShowCreate(false)}
           onSaved={(doc) => {
             setShowCreate(false);
+            // Новый документ попадает в чьи-то сохранённые фильтры — счётчики
+            // должны пересчитаться, даже если сейчас мы уходим в карточку.
+            setViewsReloadKey((k) => k + 1);
             navigate(`/documents/${doc.id}`);
           }}
         />
@@ -514,21 +608,57 @@ export function Documents() {
   );
 }
 
+/**
+ * Ячейка-ссылка. Раньше строка открывалась через onClick на <tr>: такую «ссылку»
+ * не видит скринридер, на неё не встать с клавиатуры и не открыть документ средней
+ * кнопкой или Ctrl+кликом — а реестр это главный экран бухгалтера. Теперь ссылка
+ * настоящая и растянута на всю ячейку, поэтому попадание мышью не изменилось.
+ * В обход по Tab пускаем только номер документа (tabbable): восемь остановок
+ * на строку сделали бы клавиатурную работу невозможной.
+ */
+function CellLink({
+  to,
+  tabbable,
+  cellClassName,
+  className,
+  children,
+}: {
+  to: string;
+  tabbable?: boolean;
+  cellClassName?: string;
+  className?: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <TableCell className={cn('p-0', cellClassName)}>
+      <Link
+        to={to}
+        tabIndex={tabbable ? undefined : -1}
+        className={cn(
+          'block px-2 py-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-slate-950',
+          className
+        )}
+      >
+        {children}
+      </Link>
+    </TableCell>
+  );
+}
+
 function DocumentRow({
   doc,
   checked,
   onToggle,
-  onOpen,
 }: {
   doc: Document;
   checked: boolean;
   onToggle: () => void;
-  onOpen: () => void;
 }) {
   const due = dueLabel(doc.dueDate);
+  const to = `/documents/${doc.id}`;
   return (
-    <TableRow className={cn('cursor-pointer', checked && 'bg-slate-50')} onClick={onOpen}>
-      <TableCell className="px-2 py-2" onClick={(e) => e.stopPropagation()}>
+    <TableRow className={cn(checked && 'bg-slate-50')}>
+      <TableCell className="px-2 py-2">
         <input
           type="checkbox"
           className="h-4 w-4 cursor-pointer rounded border-slate-300"
@@ -537,28 +667,30 @@ function DocumentRow({
           aria-label={`Выделить ${doc.number}`}
         />
       </TableCell>
-      <TableCell className="whitespace-nowrap px-2 py-2 text-slate-500">{formatDate(doc.docDate)}</TableCell>
-      <TableCell className="px-2 py-2">
+      <CellLink to={to} className="whitespace-nowrap text-slate-500">
+        {formatDate(doc.docDate)}
+      </CellLink>
+      <CellLink to={to} tabbable>
         <div className="font-medium text-slate-900">{doc.number}</div>
         <div className="text-xs text-slate-400">{DOC_TYPE_SHORT[doc.type]}</div>
-      </TableCell>
-      <TableCell className="max-w-[220px] px-2 py-2">
+      </CellLink>
+      <CellLink to={to} cellClassName="max-w-[220px]">
         <div className="truncate text-slate-700">{doc.counterpartyName ?? '—'}</div>
         {doc.purpose && <div className="truncate text-xs text-slate-400">{doc.purpose}</div>}
-      </TableCell>
-      <TableCell className="whitespace-nowrap px-2 py-2 text-right font-medium tabular-nums text-slate-900">
+      </CellLink>
+      <CellLink to={to} className="whitespace-nowrap text-right font-medium tabular-nums text-slate-900">
         {formatAmount(doc.amount)}
         {doc.paid > 0 && doc.paid < doc.amount && (
           <div className="text-xs font-normal text-amber-600">−{formatAmount(doc.paid)}</div>
         )}
-      </TableCell>
-      <TableCell className="whitespace-nowrap px-2 py-2 text-right tabular-nums text-slate-400">
+      </CellLink>
+      <CellLink to={to} className="whitespace-nowrap text-right tabular-nums text-slate-400">
         {doc.vat > 0 ? formatAmount(doc.vat) : '—'}
-      </TableCell>
-      <TableCell className="max-w-[140px] px-2 py-2">
+      </CellLink>
+      <CellLink to={to} cellClassName="max-w-[140px]">
         <span className="block truncate text-xs text-slate-500">{doc.expenseItemName ?? '—'}</span>
-      </TableCell>
-      <TableCell className="whitespace-nowrap px-2 py-2">
+      </CellLink>
+      <CellLink to={to} className="whitespace-nowrap">
         {due ? (
           <div className={cn('text-xs', due.overdue ? 'font-medium text-red-600' : 'text-slate-500')}>
             <div>{formatDate(doc.dueDate)}</div>
@@ -567,16 +699,58 @@ function DocumentRow({
         ) : (
           <span className="text-xs text-slate-300">—</span>
         )}
-      </TableCell>
-      <TableCell className="px-2 py-2">
+      </CellLink>
+      <CellLink to={to}>
         <div className="flex flex-wrap gap-1">
           <ApprovalChip status={doc.approvalStatus} />
           <OriginalChip status={doc.originalStatus} />
           <PaymentChip state={doc.paymentState} />
           <PostingChip status={doc.postingStatus} />
         </div>
-      </TableCell>
+      </CellLink>
     </TableRow>
+  );
+}
+
+/**
+ * Заголовок-сортировка. Сервер сортировку уже умеет, а параметры лежат в URL и
+ * в пресетах — не хватало только способа их задать мышью. aria-sort нужен, чтобы
+ * скринридер называл текущий порядок, а не только «кнопка Сумма».
+ */
+function SortHeader({
+  column,
+  label,
+  sort,
+  dir,
+  onSort,
+  align = 'left',
+}: {
+  column: string;
+  label: string;
+  sort: string;
+  dir: 'asc' | 'desc';
+  onSort: (column: string) => void;
+  align?: 'left' | 'right';
+}) {
+  const active = sort === column;
+  const Icon = !active ? ChevronsUpDown : dir === 'asc' ? ArrowUp : ArrowDown;
+  return (
+    <TableHead
+      className={cn('px-2', align === 'right' && 'text-right')}
+      aria-sort={active ? (dir === 'asc' ? 'ascending' : 'descending') : 'none'}
+    >
+      <button
+        type="button"
+        onClick={() => onSort(column)}
+        className={cn(
+          'inline-flex items-center gap-1 rounded font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-950',
+          active ? 'text-slate-900' : 'hover:text-slate-700'
+        )}
+      >
+        {label}
+        <Icon className={cn('h-3.5 w-3.5', active ? 'text-slate-700' : 'text-slate-300')} />
+      </button>
+    </TableHead>
   );
 }
 
@@ -591,7 +765,11 @@ function Toggle({
 }) {
   return (
     <button
+      type="button"
       onClick={onClick}
+      // Кнопка-тумблер: без aria-pressed скринридер прочитает её как обычную
+      // кнопку и не скажет, включён фильтр или нет.
+      aria-pressed={active}
       className={cn(
         'h-10 rounded-md border px-3 text-sm font-medium transition-colors',
         active

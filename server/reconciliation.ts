@@ -17,6 +17,11 @@
  * Отклонённые документы не создают долга и потому исключены с обеих сторон —
  * и из начислений, и из привязанных к ним оплат. Исключать их только из одной
  * половины нельзя: тождество разъедется.
+ *
+ * Счёт, закрытый актом или накладной, начисляется один раз — по закрывающему
+ * документу (см. NOT_CLOSED). Тождество от этого не страдает: правило одно
+ * и для сальдо на начало, и для оборотов, поэтому сцепка периодов держится —
+ * конец января равен началу февраля при любой расстановке связей.
  */
 
 import { db } from './db';
@@ -24,6 +29,26 @@ import { DOC_TYPE_SHORT, type DocType } from '../shared/domain';
 
 /** Отклонённые документы не участвуют в расчётах — условие одно на все запросы. */
 const NOT_REJECTED = `d.approval_status <> 'rejected'`;
+
+/**
+ * Счёт на оплату сам по себе обязательства не создаёт — начисление создаёт
+ * закрывающий документ (акт выполненных работ, накладная). Пока связи не было,
+ * обычный поток «завели счёт → оплатили → пришёл акт» задваивал сальдо: счёт
+ * и акт складывались оба. Поэтому из НАЧИСЛЕНИЙ выпадает документ, на который
+ * ссылается `closes_document_id` другого не отклонённого документа.
+ *
+ * Из ОПЛАТ счёт не исключается: платежи разносятся именно на него, он остаётся
+ * носителем оплаты. Отсюда асимметрия — условие стоит только в начислениях.
+ *
+ * Правило обязано дословно совпадать с BALANCE_SELECT в routes/counterparties.ts:
+ * акт сверки за всю историю сходится с долгом на карточке контрагента до тиына,
+ * и разъехавшиеся правила разъедут эти две цифры молча.
+ */
+const NOT_CLOSED = `NOT EXISTS (
+           SELECT 1 FROM documents c
+           WHERE c.closes_document_id = d.id AND c.id <> d.id
+             AND c.approval_status <> 'rejected'
+         )`;
 
 export interface TurnoverLine {
   kind: 'document' | 'payment';
@@ -64,8 +89,11 @@ export interface Statement {
    */
   excludedPaid: number;
   excludedPaidCount: number;
-  /** Пары «счёт и акт на одну сумму» — вероятный двойной счёт одной услуги. */
-  duplicates: { amount: number; numbers: string }[];
+  /**
+   * Пары «счёт и акт на одну сумму» без проставленной связи — вероятный
+   * двойной счёт одной услуги. `hint` говорит, чем пару закрыть.
+   */
+  duplicates: { amount: number; numbers: string; hint: string }[];
   lines: TurnoverLine[];
 }
 
@@ -78,7 +106,8 @@ export function openingBalance(counterpartyId: number, from: string): number {
       `SELECT
          COALESCE((
            SELECT SUM(d.amount_minor) FROM documents d
-           WHERE d.counterparty_id = ? AND ${NOT_REJECTED} AND d.doc_date < ?
+           WHERE d.counterparty_id = ? AND ${NOT_REJECTED} AND ${NOT_CLOSED}
+             AND d.doc_date < ?
          ), 0) AS accrued,
          COALESCE((
            SELECT SUM(dp.amount_minor)
@@ -120,7 +149,8 @@ export function turnover(counterpartyId: number, from: string, to: string): Turn
     .prepare(
       `SELECT d.id, d.type, d.number, d.doc_date, d.amount_minor, d.vat_minor, d.purpose
        FROM documents d
-       WHERE d.counterparty_id = ? AND ${NOT_REJECTED} AND d.doc_date >= ? AND d.doc_date <= ?
+       WHERE d.counterparty_id = ? AND ${NOT_REJECTED} AND ${NOT_CLOSED}
+         AND d.doc_date >= ? AND d.doc_date <= ?
        ORDER BY d.doc_date, d.id`
     )
     .all(counterpartyId, from, to) as DocLineRow[];
@@ -129,6 +159,10 @@ export function turnover(counterpartyId: number, from: string, to: string): Turn
   // поручение и одной строкой его и покажет. Суммируется только dp.amount_minor
   // по документам ЭТОГО контрагента — один платёж режется на разных, и брать
   // p.amount_minor значило бы затащить в акт чужие деньги.
+  //
+  // NOT_CLOSED здесь намеренно нет: счёт, закрытый актом, из начислений вышел,
+  // но носителем оплаты остался. Убрать его отсюда значило бы потерять живые
+  // деньги с расчётного счёта и сломать тождество.
   const pays = db
     .prepare(
       `SELECT p.id AS payment_id, p.payment_date, p.reference,
@@ -184,6 +218,9 @@ export function turnover(counterpartyId: number, from: string, to: string): Turn
  * согласованы. Они входят в сальдо — так же, как в карточке контрагента, —
  * но контрагенту уходит сумма, по которой решение не принято, и об этом
  * бухгалтер обязан узнать до отправки, а не после.
+ *
+ * NOT_CLOSED здесь такой же, как в начислениях: предупреждение обещает
+ * «вошло в сальдо», и считать в нём счёт, которого в сальдо нет, — врать.
  */
 function unapprovedInRange(
   counterpartyId: number,
@@ -194,7 +231,7 @@ function unapprovedInRange(
     .prepare(
       `SELECT COALESCE(SUM(d.amount_minor), 0) AS amount, COUNT(*) AS count
        FROM documents d
-       WHERE d.counterparty_id = ?
+       WHERE d.counterparty_id = ? AND ${NOT_CLOSED}
          AND d.approval_status IN ('draft','review','returned')
          AND d.doc_date >= ? AND d.doc_date <= ?`
     )
@@ -203,10 +240,19 @@ function unapprovedInRange(
 }
 
 /**
- * Неразнесённый остаток платежей, которые хотя бы частично легли на документы
- * этого контрагента. К контрагенту такой остаток не привязан ничем, кроме
- * этого косвенного признака, поэтому в сальдо он не идёт — только в
- * предупреждение «похоже на аванс».
+ * Неразнесённый остаток платежей, которые легли на документы этого
+ * контрагента. К контрагенту такой остаток не привязан ничем, кроме этого
+ * косвенного признака (у платежа своего контрагента нет), поэтому в сальдо
+ * он не идёт — только в предупреждение «похоже на аванс».
+ *
+ * Берутся лишь платежи, ВСЕ разнесения которых ушли этому контрагенту.
+ * Платёж, разбитый между несколькими, остатка не даёт: раньше остаток целиком
+ * приписывался каждому задетому контрагенту, и один и тот же «аванс» на
+ * 30 000 всплывал в акте и у А, и у Б. Делить остаток пропорционально значило
+ * бы выдумать цифру — предупреждение молчит, пока платёж не разнесут.
+ *
+ * Отклонённые документы, как и везде в модуле, признаком не считаются: долга
+ * они не создают, и аванс по ним объяснять нечем.
  */
 function unallocatedFor(counterpartyId: number, from: string, to: string): number {
   const row = db
@@ -222,10 +268,16 @@ function unallocatedFor(counterpartyId: number, from: string, to: string): numbe
          AND EXISTS (
            SELECT 1 FROM document_payments dp
            JOIN documents d ON d.id = dp.document_id
-           WHERE dp.payment_id = p.id AND d.counterparty_id = ?
+           WHERE dp.payment_id = p.id AND d.counterparty_id = ? AND ${NOT_REJECTED}
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM document_payments dp2
+           JOIN documents d2 ON d2.id = dp2.document_id
+           WHERE dp2.payment_id = p.id
+             AND (d2.counterparty_id IS NULL OR d2.counterparty_id <> ?)
          )`
     )
-    .get(from, to, counterpartyId) as { rest: number };
+    .get(from, to, counterpartyId, counterpartyId) as { rest: number };
   return row.rest;
 }
 
@@ -272,27 +324,52 @@ function excludedPaidInRange(
 
 /**
  * Счёт на оплату сам по себе обязательства не создаёт — его создаёт акт или
- * накладная. Если за период есть и счёт, и акт на ровно одну сумму, услуга
- * почти наверняка посчитана дважды, и контрагент это заметит. Приложение не
- * решает за бухгалтера, а показывает пару.
+ * накладная. Если за период есть и счёт, и акт на ровно одну сумму, а связь
+ * между ними не проставлена, услуга почти наверняка посчитана дважды,
+ * и контрагент это заметит. Приложение не решает за бухгалтера, а показывает
+ * пару и говорит, чем её закрыть.
+ *
+ * Связанная пара молчит: по ней начисление уже одно — счёт из оборотов вышел
+ * по NOT_CLOSED, задваивать нечего.
+ *
+ * Пары ищутся самосоединением, а не группировкой по сумме: связь стоит между
+ * двумя конкретными документами, и группа «всё на 120 000» проверить её
+ * не даёт — одна проставленная связь глушила бы предупреждение по остальным.
  */
 function duplicatePairs(
   counterpartyId: number,
   from: string,
   to: string
-): { amount: number; numbers: string }[] {
-  return db
+): { amount: number; numbers: string; hint: string }[] {
+  const pairs = db
     .prepare(
-      `SELECT d.amount_minor AS amount, GROUP_CONCAT(d.number, ' и ') AS numbers
-       FROM documents d
-       WHERE d.counterparty_id = ? AND ${NOT_REJECTED}
-         AND d.doc_date >= ? AND d.doc_date <= ?
-         AND d.type IN ('invoice','act','waybill')
-       GROUP BY d.amount_minor
-       HAVING COUNT(DISTINCT d.type) > 1
-       ORDER BY d.amount_minor DESC`
+      `SELECT a.amount_minor AS amount, a.number AS first_number, b.number AS second_number
+       FROM documents a
+       JOIN documents b
+         ON b.counterparty_id = a.counterparty_id
+        AND b.amount_minor = a.amount_minor
+        AND b.id > a.id
+        AND b.type <> a.type
+       WHERE a.counterparty_id = ?
+         AND a.approval_status <> 'rejected' AND b.approval_status <> 'rejected'
+         AND a.type IN ('invoice','act','waybill') AND b.type IN ('invoice','act','waybill')
+         AND a.doc_date >= ? AND a.doc_date <= ?
+         AND b.doc_date >= ? AND b.doc_date <= ?
+         AND (a.closes_document_id IS NULL OR a.closes_document_id <> b.id)
+         AND (b.closes_document_id IS NULL OR b.closes_document_id <> a.id)
+       ORDER BY a.amount_minor DESC, a.id, b.id`
     )
-    .all(counterpartyId, from, to) as { amount: number; numbers: string }[];
+    .all(counterpartyId, from, to, from, to) as {
+    amount: number;
+    first_number: string;
+    second_number: string;
+  }[];
+
+  return pairs.map((p) => ({
+    amount: p.amount,
+    numbers: `${p.first_number} и ${p.second_number}`,
+    hint: 'Если один документ закрывает другой, укажите это в закрывающем документе — тогда начисление останется одно, а счёт останется носителем оплаты',
+  }));
 }
 
 /** Полная оборотная ведомость по контрагенту за период. */
@@ -332,4 +409,6 @@ export function statement(counterpartyId: number, from: string, to: string): Sta
  */
 export const BASIS_TEXT =
   'В расчёт включены все документы, кроме отклонённых, и оплаты по ним. ' +
+  'Счёт, закрытый актом или накладной, начислен один раз — по закрывающему документу, ' +
+  'а оплата отнесена к самому счёту. ' +
   'Начисления отнесены к дате документа, оплаты — к дате платежа.';

@@ -1,13 +1,15 @@
 import Database from 'better-sqlite3';
 import { scryptSync, randomBytes, timingSafeEqual } from 'node:crypto';
-import { mkdirSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { copyFileSync, existsSync, mkdirSync, readdirSync, unlinkSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 // Циклический импорт: reconciliation.ts берёт отсюда `db`, но трогает его
 // только внутри функций — к моменту вызова из seed() он уже создан. Считать
 // снимок здесь своим SQL было бы шестой копией арифметики сальдо.
 import { statement } from './reconciliation';
 import {
   CLOSING_TASK_TEMPLATE,
+  vatFromGross,
   type ApprovalStatus,
   type DocType,
   type OriginalStatus,
@@ -15,12 +17,26 @@ import {
   type Section,
 } from '../shared/domain';
 
-const DB_PATH = process.env.DB_PATH || 'server/data/govfin.db';
+/**
+ * Пути считаются от расположения модуля, а не от текущего каталога. Раньше
+ * запуск сервера из любого другого места молча заводил вторую пустую базу
+ * рядом, и вся бухгалтерия выглядела стёртой, хотя лежала в первом файле.
+ * Переменные окружения по-прежнему главнее — на них живут тесты.
+ */
+const SERVER_DIR = dirname(fileURLToPath(import.meta.url));
+const DB_PATH = process.env.DB_PATH || join(SERVER_DIR, 'data', 'govfin.db');
+const DATA_DIR = dirname(DB_PATH);
 
 /** Каталог для вложений. Лежит рядом с БД и так же не попадает в git. */
-export const UPLOAD_DIR = process.env.UPLOAD_DIR || join(dirname(DB_PATH), 'uploads');
+export const UPLOAD_DIR = process.env.UPLOAD_DIR || join(DATA_DIR, 'uploads');
 
-mkdirSync(dirname(DB_PATH), { recursive: true });
+/**
+ * Копии базы лежат рядом с ней же. Это важно для тестов: они поднимают сервер
+ * с базой во временном каталоге, и копии уезжают туда, а не в рабочее дерево.
+ */
+const BACKUP_DIR = process.env.BACKUP_DIR || join(DATA_DIR, 'backups');
+
+mkdirSync(DATA_DIR, { recursive: true });
 mkdirSync(UPLOAD_DIR, { recursive: true });
 
 export const db = new Database(DB_PATH);
@@ -38,10 +54,18 @@ db.function('rulower', { deterministic: true }, (value: unknown) =>
 );
 
 /**
- * Версия схемы. При несовпадении база пересоздаётся целиком —
- * прежняя схема госоргана (requests / ifp_data / integrations) несовместима.
+ * Версия схемы. Поднимается вместе с новым шагом в MIGRATIONS: несовпадение
+ * версии больше не повод стирать базу — недостающие шаги накатываются по
+ * одному, с сохранением данных.
  */
-const SCHEMA_VERSION = 6;
+const SCHEMA_VERSION = 7;
+
+/**
+ * Ниже этой версии инкрементальных шагов нет: там жила схема госоргана
+ * (requests / ifp_data / integrations), от которой не осталось ни одной общей
+ * таблицы. Такую базу можно только пересоздать вручную — RESET_DB=1.
+ */
+const OLDEST_UPGRADABLE = 6;
 
 // ── Пароли ──────────────────────────────────────────────────────────────────
 
@@ -164,34 +188,102 @@ export function isPeriodClosed(period: string): boolean {
   return row?.status === 'closed';
 }
 
+// ── Бэкапы ──────────────────────────────────────────────────────────────────
+
+/**
+ * Вся бухгалтерия компании — один файл SQLite. Пока копий не было, внедрять
+ * портал было нельзя: любая ошибка обновления, диска или оператора стоила бы
+ * всего учёта разом. Держим последние семь копий — недели хватает, чтобы
+ * заметить порчу данных и откатиться.
+ */
+const BACKUP_KEEP = 7;
+const BACKUP_SUFFIX = '.bak';
+
+function backupName(reason: string): string {
+  const d = new Date();
+  const stamp =
+    `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}` +
+    `-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+  return `${basename(DB_PATH)}.${stamp}.${reason}${BACKUP_SUFFIX}`;
+}
+
+/**
+ * Убирает копии за пределами BACKUP_KEEP. Метка времени в имени фиксированной
+ * ширины, поэтому сортировка по имени — это сортировка по дате.
+ */
+function rotateBackups(): void {
+  const prefix = `${basename(DB_PATH)}.`;
+  const files = readdirSync(BACKUP_DIR)
+    .filter((f) => f.startsWith(prefix) && f.endsWith(BACKUP_SUFFIX))
+    .sort();
+  for (const stale of files.slice(0, Math.max(files.length - BACKUP_KEEP, 0))) {
+    unlinkSync(join(BACKUP_DIR, stale));
+  }
+}
+
+/**
+ * Копия базы «на живую», без остановки сервера. Асинхронная, потому что
+ * better-sqlite3 копирует страницами — это и нужно для регулярного бэкапа.
+ */
+export async function backupDatabase(reason = 'daily'): Promise<string | null> {
+  if (!existsSync(DB_PATH)) return null;
+  mkdirSync(BACKUP_DIR, { recursive: true });
+  const dest = join(BACKUP_DIR, backupName(reason));
+  await db.backup(dest);
+  rotateBackups();
+  console.log(`Копия базы: ${dest}`);
+  return dest;
+}
+
+/**
+ * Синхронная копия для момента запуска: перед миграцией и перед RESET_DB
+ * дождаться промиса негде — модуль поднимается верхнеуровневым кодом, а
+ * данные обязаны быть сохранены ДО первого ALTER или DROP.
+ *
+ * Копировать один .db-файл при journal_mode = WAL нельзя: свежие транзакции
+ * лежат в отдельном файле и в копию не попали бы. Поэтому сначала сливаем WAL
+ * в основной файл, и только потом копируем.
+ */
+function backupSync(reason: string): string | null {
+  if (!existsSync(DB_PATH)) return null;
+  mkdirSync(BACKUP_DIR, { recursive: true });
+  db.pragma('wal_checkpoint(TRUNCATE)');
+  const dest = join(BACKUP_DIR, backupName(reason));
+  copyFileSync(DB_PATH, dest);
+  rotateBackups();
+  return dest;
+}
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+const backupTimer = setInterval(() => {
+  backupDatabase('daily').catch((err) => console.error('Не удалось снять копию базы:', err));
+}, DAY_MS);
+// Бэкап — не повод держать процесс живым: без unref() не завершились бы ни
+// тесты, ни разовые скрипты, дёргающие этот модуль.
+backupTimer.unref();
+
 // ── Схема ───────────────────────────────────────────────────────────────────
 
+/**
+ * Снос всех таблиц. Вызывается только по явной команде RESET_DB=1 и только
+ * после копии. schema_meta очищается тоже: иначе после сноса версия осталась
+ * бы «актуальной» и приложение подняло бы пустую базу без пользователей.
+ */
 function dropEverything(): void {
   const tables = db
     .prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'`)
     .all() as { name: string }[];
+  // PRAGMA foreign_keys внутри транзакции — no-op, поэтому снос идёт без неё.
   db.pragma('foreign_keys = OFF');
   for (const t of tables) {
     if (t.name === 'schema_meta') continue;
     db.exec(`DROP TABLE IF EXISTS "${t.name}"`);
   }
+  db.exec('DELETE FROM schema_meta');
   db.pragma('foreign_keys = ON');
 }
 
-function migrate(): boolean {
-  db.exec(`CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`);
-  const row = db.prepare(`SELECT value FROM schema_meta WHERE key = 'version'`).get() as
-    | { value: string }
-    | undefined;
-
-  const isFresh = row?.value !== String(SCHEMA_VERSION);
-  if (!isFresh) return false;
-
-  if (row) {
-    console.log(`Схема устарела (v${row.value} → v${SCHEMA_VERSION}), база пересоздаётся.`);
-  }
-  dropEverything();
-
+function createSchema(): void {
   db.exec(`
     CREATE TABLE users (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -261,6 +353,13 @@ function migrate(): boolean {
       approval_status TEXT NOT NULL CHECK(approval_status IN ('draft','review','approved','returned','rejected')),
       original_status TEXT NOT NULL CHECK(original_status IN ('none','scan','received','signed')),
       posting_status TEXT NOT NULL CHECK(posting_status IN ('not_posted','posted')),
+      -- «Этот акт или накладная закрывает вот этот счёт». Счёт на оплату сам
+      -- по себе обязательства не создаёт — начисление создаёт закрывающий
+      -- документ. Поэтому счёт, на который ссылается не отклонённый акт или
+      -- накладная, выпадает из начислений, но остаётся носителем оплаты:
+      -- платежи разносятся именно на него. Без этой ссылки поток
+      -- «счёт → оплата → акт» задваивал сальдо по контрагенту.
+      closes_document_id INTEGER REFERENCES documents(id),
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
@@ -429,12 +528,20 @@ function migrate(): boolean {
       created_at TEXT NOT NULL
     );
 
-    CREATE INDEX idx_documents_approval ON documents(approval_status);
+    -- Реестр почти никогда не фильтрует по одному полю: типовые сочетания —
+    -- «на проверке по моему участку», «этот контрагент за период», «мои
+    -- документы в работе». Составной индекс закрывает и сочетание, и запрос
+    -- по одному первому полю, поэтому отдельных индексов на approval_status,
+    -- counterparty_id и responsible_user_id больше нет.
+    CREATE INDEX idx_documents_approval_section ON documents(approval_status, section);
+    CREATE INDEX idx_documents_counterparty_date ON documents(counterparty_id, doc_date);
+    CREATE INDEX idx_documents_responsible_approval ON documents(responsible_user_id, approval_status);
     CREATE INDEX idx_documents_section ON documents(section);
-    CREATE INDEX idx_documents_counterparty ON documents(counterparty_id);
     CREATE INDEX idx_documents_due ON documents(due_date);
     CREATE INDEX idx_documents_period ON documents(period);
-    CREATE INDEX idx_documents_responsible ON documents(responsible_user_id);
+    -- Сортировка реестра по умолчанию и отсечение оборотов по дате документа.
+    CREATE INDEX idx_documents_date ON documents(doc_date);
+    CREATE INDEX idx_documents_closes ON documents(closes_document_id);
     CREATE INDEX idx_doc_payments_document ON document_payments(document_id);
     CREATE INDEX idx_doc_payments_payment ON document_payments(payment_id);
     CREATE INDEX idx_attachments_document ON attachments(document_id);
@@ -450,13 +557,135 @@ function migrate(): boolean {
     -- без него каждый акт и каждый пересчёт дрейфа сканируют payments целиком.
     CREATE INDEX idx_payments_date ON payments(payment_date);
   `);
+}
 
+function setVersion(version: number): void {
   db.prepare(
     `INSERT INTO schema_meta (key, value) VALUES ('version', ?)
      ON CONFLICT(key) DO UPDATE SET value = excluded.value`
-  ).run(String(SCHEMA_VERSION));
+  ).run(String(version));
+}
 
-  return true;
+interface Migration {
+  /** Версия, до которой поднимает шаг. */
+  to: number;
+  /** Что меняется — уходит в лог обновления. */
+  what: string;
+  run: () => void;
+}
+
+/**
+ * Пошаговое обновление уже работающей базы. Ни один шаг не имеет права терять
+ * данные: в файле лежит вся первичка компании, а вложения к ней — на диске
+ * рядом, и пересоздание базы оставляло бы их сиротами.
+ */
+const MIGRATIONS: Migration[] = [
+  {
+    to: 7,
+    what: 'ссылка на закрывающий документ и составные индексы реестра',
+    run: () => {
+      // ADD COLUMN с REFERENCES разрешён, пока значение по умолчанию — NULL:
+      // старые строки просто остаются без закрывающего документа.
+      db.exec(`
+        ALTER TABLE documents ADD COLUMN closes_document_id INTEGER REFERENCES documents(id);
+        CREATE INDEX IF NOT EXISTS idx_documents_closes ON documents(closes_document_id);
+        CREATE INDEX IF NOT EXISTS idx_documents_approval_section ON documents(approval_status, section);
+        CREATE INDEX IF NOT EXISTS idx_documents_counterparty_date ON documents(counterparty_id, doc_date);
+        CREATE INDEX IF NOT EXISTS idx_documents_responsible_approval ON documents(responsible_user_id, approval_status);
+        CREATE INDEX IF NOT EXISTS idx_documents_date ON documents(doc_date);
+        DROP INDEX IF EXISTS idx_documents_approval;
+        DROP INDEX IF EXISTS idx_documents_counterparty;
+        DROP INDEX IF EXISTS idx_documents_responsible;
+      `);
+    },
+  },
+];
+
+/**
+ * Приводит базу к SCHEMA_VERSION. Три разных случая, и путать их нельзя:
+ * базы нет — собираем целиком, база старее — накатываем шаги, база новее —
+ * останавливаемся с ошибкой. Прежняя версия при любом несовпадении сносила
+ * всё подряд, то есть теряла бухгалтерию на первом же обновлении кода.
+ */
+function migrate(): void {
+  db.exec(`CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`);
+
+  if (process.env.RESET_DB === '1') {
+    console.warn('RESET_DB=1 — база пересоздаётся, все данные будут стёрты.');
+    const copy = backupSync('reset');
+    if (copy) console.warn(`Копия прежней базы: ${copy}`);
+    dropEverything();
+  }
+
+  const row = db.prepare(`SELECT value FROM schema_meta WHERE key = 'version'`).get() as
+    | { value: string }
+    | undefined;
+  const current = row ? Number(row.value) : 0;
+  if (row && !Number.isInteger(current)) {
+    throw new Error(`schema_meta.version = «${row.value}» — не число. Разберитесь с файлом ${DB_PATH} вручную.`);
+  }
+
+  if (current === 0) {
+    // Базы ещё нет: схема, демо-данные и версия — одной транзакцией. Раньше
+    // версия писалась до seed, и падение seed посередине оставляло базу
+    // навсегда «актуальной», но полупустой — без пользователей войти в неё
+    // было уже нельзя, а повторный запуск ничего не исправлял.
+    const build = db.transaction(() => {
+      createSchema();
+      seed();
+      setVersion(SCHEMA_VERSION);
+    });
+    build();
+    return;
+  }
+
+  if (current === SCHEMA_VERSION) return;
+
+  if (current > SCHEMA_VERSION) {
+    throw new Error(
+      `База версии ${current}, а код рассчитан на ${SCHEMA_VERSION}. Похоже на откат кода назад. ` +
+        'Верните подходящую версию приложения: стирать данные из-за отката нельзя.'
+    );
+  }
+
+  if (current < OLDEST_UPGRADABLE) {
+    throw new Error(
+      `База версии ${current} несовместима: общих таблиц с текущей схемой нет. ` +
+        'Перенесите данные вручную или пересоздайте базу явно: RESET_DB=1 (копия снимется автоматически).'
+    );
+  }
+
+  // Версия записана, а таблиц нет — половинчатое состояние после ручного
+  // вмешательства. Молча пересобирать нельзя: именно так и теряются данные.
+  const hasCore = db
+    .prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'documents'`)
+    .get();
+  if (!hasCore) {
+    throw new Error(
+      `В базе записана версия ${current}, но таблицы documents нет. ` +
+        'База повреждена — восстановите её из копии или пересоздайте явно: RESET_DB=1.'
+    );
+  }
+
+  const steps = MIGRATIONS.filter((m) => m.to > current).sort((a, b) => a.to - b.to);
+  if (steps.length === 0) {
+    throw new Error(`Нет шага обновления с версии ${current} на ${SCHEMA_VERSION} — обновите MIGRATIONS.`);
+  }
+
+  const copy = backupSync('migrate');
+  console.log(
+    `Обновление схемы: v${current} → v${SCHEMA_VERSION}${copy ? `. Копия до обновления: ${copy}` : ''}`
+  );
+  for (const step of steps) {
+    // Шаг и запись версии — в одной транзакции: если ALTER упадёт, версия
+    // останется прежней и следующий запуск повторит ровно этот шаг.
+    const apply = db.transaction(() => {
+      step.run();
+      setVersion(step.to);
+    });
+    apply();
+    console.log(`  v${step.to}: ${step.what}`);
+  }
 }
 
 // ── Seed ────────────────────────────────────────────────────────────────────
@@ -481,9 +710,17 @@ interface SeedDoc {
   posting: PostingStatus;
   /** Сколько тенге уже оплачено — создаст платёж и разнесение. */
   paidTenge?: number;
+  /** Номер счёта, который закрывает этот акт или накладная. */
+  closes?: string;
   comments?: { user: number; body: string; kind?: string }[];
 }
 
+/**
+ * Демо-данные. Вызывается только при сборке новой базы и только внутри
+ * транзакции migrate(): своих транзакций здесь нет, а те, что приходят из
+ * ensurePeriod(), better-sqlite3 вкладывает через SAVEPOINT — откат внешней
+ * транзакции снимет и их.
+ */
 function seed(): void {
   const createdAt = nowTimestamp();
 
@@ -636,11 +873,15 @@ function seed(): void {
       comments: [{ user: uAnna, body: 'Оригинал в пути, обещали курьером до конца недели.' }],
     },
     {
+      // Закрывает счёт СЧ-9902 на ту же сумму: поставка одна, а документов
+      // два. Начисление создаёт накладная, счёт остаётся носителем оплаты —
+      // без связи 189 500 ₸ сидели в сальдо «Глобал Офис» дважды.
       type: 'waybill', number: 'НК-4521', docDate: shiftDays(-8), dueDate: null,
       counterparty: cpOffice, expenseItem: items.KANC, tenge: 189_500, vat: true,
-      purpose: 'Накладная на канцтовары',
+      purpose: 'Накладная на канцтовары по счёту СЧ-9902',
       section: 'inventory', responsible: uMarat, createdBy: uMarat,
       approval: 'review', original: 'received', posting: 'not_posted',
+      closes: 'СЧ-9902',
     },
     {
       type: 'expense_report', number: 'АО-56', docDate: shiftDays(-5), dueDate: shiftDays(2),
@@ -689,8 +930,8 @@ function seed(): void {
     `INSERT INTO documents
       (type, number, doc_date, due_date, period, counterparty_id, contract_id, expense_item_id,
        amount_minor, vat_minor, purpose, section, responsible_user_id, created_by,
-       approval_status, original_status, posting_status, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       approval_status, original_status, posting_status, closes_document_id, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   );
   const insertComment = db.prepare(
     'INSERT INTO comments (document_id, user_id, user_name, body, kind, created_at) VALUES (?, ?, ?, ?, ?, ?)'
@@ -706,19 +947,37 @@ function seed(): void {
   const nameById = new Map(userNames.map((u) => [u.id, u.name]));
 
   let paymentNo = 340;
+  // Закрывающий документ ссылается на счёт по номеру, а id счёта известен
+  // только после вставки — поэтому номера копятся по ходу цикла, а закрываемый
+  // счёт в списке всегда стоит раньше своего акта или накладной.
+  const idByNumber = new Map<string, number>();
   for (const d of docs) {
-    // НДС в РК выделяется из суммы с налогом: 12/112.
+    // НДС выделяется из суммы с налогом по ставке на дату документа: с
+    // 2026-01-01 в РК 16 %, до неё 12 %. Захардкоженные 12/112 после Нового
+    // года занижали бы зачётный НДС по каждому счёту.
     const amountMinor = d.tenge * T;
-    const vatMinor = d.vat ? Math.round((amountMinor * 12) / 112) : 0;
+    const vatMinor = d.vat ? vatFromGross(amountMinor, d.docDate) : 0;
     const ts = `${d.docDate} 09:00:00`;
+
+    let closesId: number | null = null;
+    if (d.closes) {
+      closesId = idByNumber.get(d.closes) ?? null;
+      // Молча оставить связь пустой нельзя: демо тогда выглядит рабочим,
+      // а задвоение сальдо возвращается незаметно.
+      if (closesId === null) {
+        throw new Error(`Документ ${d.number} закрывает ${d.closes}, но такого счёта в seed нет или он идёт позже`);
+      }
+    }
+
     const docId = Number(
       insertDoc.run(
         d.type, d.number, d.docDate, d.dueDate, periodOf(d.docDate),
         d.counterparty ?? null, d.expenseItem,
         amountMinor, vatMinor, d.purpose, d.section, d.responsible, d.createdBy,
-        d.approval, d.original, d.posting, ts, ts
+        d.approval, d.original, d.posting, closesId, ts, ts
       ).lastInsertRowid
     );
+    idByNumber.set(d.number, docId);
 
     for (const c of d.comments ?? []) {
       insertComment.run(docId, c.user, nameById.get(c.user) ?? '—', c.body, c.kind ?? 'comment', ts);
@@ -870,5 +1129,4 @@ function seedReconciliations(ids: {
   );
 }
 
-const created = migrate();
-if (created) seed();
+migrate();

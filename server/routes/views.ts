@@ -3,6 +3,7 @@ import { db, nowTimestamp, logAudit } from '../db';
 import { requireAuth, requireRole } from '../auth';
 import type { AuthUser } from '../auth';
 import { countForFilters, type ListQuery } from './documents';
+import { APPROVAL_LABELS } from '../../shared/domain';
 
 export const viewsRouter = Router();
 
@@ -17,6 +18,19 @@ const ALLOWED_KEYS = [
   'posting', 'counterparty', 'period', 'overdue', 'mine', 'sort', 'dir',
 ] as const;
 
+const APPROVAL_STATUSES = Object.keys(APPROVAL_LABELS);
+
+/**
+ * Фильтр по согласованию принимает список статусов через запятую — так плитка
+ * закрытия месяца открывает реестр ровно с теми статусами, что посчитала.
+ * Пресет обязан такой список пережить, но хранить мусор не должен: неизвестные
+ * статусы отбрасываем, и если не осталось ни одного — выкидываем ключ целиком.
+ */
+function normalizeApproval(value: string): string {
+  const picked = value.split(',').map((s) => s.trim());
+  return [...new Set(picked)].filter((s) => APPROVAL_STATUSES.includes(s)).join(',');
+}
+
 function sanitizeQuery(raw: unknown): Record<string, string> {
   if (!raw || typeof raw !== 'object') return {};
   const source = raw as Record<string, unknown>;
@@ -26,9 +40,22 @@ function sanitizeQuery(raw: unknown): Record<string, string> {
     if (typeof value !== 'string') continue;
     const trimmed = value.trim();
     if (!trimmed || trimmed === 'all') continue;
-    out[key] = trimmed.slice(0, 120);
+    const clean = key === 'approval' ? normalizeApproval(trimmed) : trimmed.slice(0, 120);
+    if (!clean) continue;
+    out[key] = clean;
   }
   return out;
+}
+
+/**
+ * Личный пресет — дело владельца, общий — дело роли: он висит на панели у всех,
+ * поэтому им распоряжается любой главбух, а не только тот, кто его завёл.
+ * Раньше и переименование, и удаление требовали совпадения user_id, и общий
+ * фильтр ушедшего главбуха оставался несменяемым навсегда.
+ */
+function canManage(row: { user_id: number | null; shared: number }, user: AuthUser): boolean {
+  if (row.shared === 1) return user.role === 'chief_accountant';
+  return row.user_id === user.id;
 }
 
 interface ViewRow {
@@ -136,15 +163,17 @@ viewsRouter.post('/', (req, res) => {
 viewsRouter.patch('/:id(\\d+)', (req, res) => {
   const user = req.user!;
   const id = Number(req.params.id);
-  const row = db.prepare('SELECT id, user_id, name FROM saved_views WHERE id = ?').get(id) as
-    | { id: number; user_id: number | null; name: string }
+  const row = db.prepare('SELECT id, user_id, name, shared FROM saved_views WHERE id = ?').get(id) as
+    | { id: number; user_id: number | null; name: string; shared: number }
     | undefined;
   if (!row) {
     res.status(404).json({ error: 'Фильтр не найден' });
     return;
   }
-  if (row.user_id !== user.id) {
-    res.status(403).json({ error: 'Переименовать можно только свой фильтр' });
+  if (!canManage(row, user)) {
+    res.status(403).json({
+      error: row.shared === 1 ? 'Общий фильтр меняет только главный бухгалтер' : 'Изменить можно только свой фильтр',
+    });
     return;
   }
 
@@ -196,10 +225,10 @@ viewsRouter.delete('/:id(\\d+)', (req, res) => {
     res.status(404).json({ error: 'Фильтр не найден' });
     return;
   }
-  // Общий пресет убирает только главбух — он у всех на панели.
-  const isOwner = row.user_id === user.id;
-  if (!isOwner || (row.shared === 1 && user.role !== 'chief_accountant')) {
-    res.status(403).json({ error: 'Удалить можно только свой личный фильтр' });
+  if (!canManage(row, user)) {
+    res.status(403).json({
+      error: row.shared === 1 ? 'Общий фильтр удаляет только главный бухгалтер' : 'Удалить можно только свой фильтр',
+    });
     return;
   }
 
